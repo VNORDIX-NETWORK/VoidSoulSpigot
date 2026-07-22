@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 09:58:46 -0500
+Subject: [PATCH] Configurable projectile behaviour
+
+- projectiles.{snowball,egg,pearl,potion}Randomness: multipliers for the
+  random spread applied when throwable projectiles are launched.
+  1.0 is vanilla, 0.0 makes trajectories exact.
+- projectiles.pearlDamage: fall damage dealt when teleporting with an
+  ender pearl (vanilla 5.0, 0 disables it, skipping the damage event
+  entirely).
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 605c60fa806dde7644753fa7248e768f50c3c550..a99b61fa8e3f40705dc076d893f6ad11f0d91f40 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -50,4 +50,22 @@ public class VoidSoulWorldConfig {
+         public double rodHorizontalMultiplier = 1.0;
+         public double rodVerticalMultiplier = 1.0;
+     }
++
++    @Comment("Projectile behaviour settings.")
++    public ProjectilesConfig projectiles;
++
++    @ConfigSerializable
++    public static class ProjectilesConfig {
++        @Comment("Multipliers for the random spread applied when these projectiles are\n" +
++                "launched. 1.0 is vanilla behaviour, 0.0 removes the randomness entirely\n" +
++                "so projectiles fly exactly where aimed.")
++        public double snowballRandomness = 1.0;
++        public double eggRandomness = 1.0;
++        public double pearlRandomness = 1.0;
++        public double potionRandomness = 1.0;
++
++        @Comment("Fall damage dealt to a player when teleporting with an ender pearl.\n" +
++                "Vanilla: 5.0. Set to 0 to disable pearl damage.")
++        public double pearlDamage = 5.0;
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityEgg.java b/src/main/java/net/minecraft/server/EntityEgg.java
+index 5d57a1181d7de44c85de58f87b98971fe8721c69..b6bec11ec1d7bf30d2bab2aaa2a94e1cd7b7d13d 100644
+--- a/src/main/java/net/minecraft/server/EntityEgg.java
++++ b/src/main/java/net/minecraft/server/EntityEgg.java
+@@ -21,6 +21,13 @@ public class EntityEgg extends EntityProjectile {
+         super(world, d0, d1, d2);
+     }
+ 
++    // VoidSoulSpigot start - configurable projectile trajectory randomness
++    @Override
++    protected double trajectoryRandomnessMultiplier() {
++        return this.world.voidsoulConfig.projectiles.eggRandomness;
++    }
++    // VoidSoulSpigot end
++
+     protected void a(MovingObjectPosition movingobjectposition) {
+         if (movingobjectposition.entity != null) {
+             movingobjectposition.entity.damageEntity(DamageSource.projectile(this, this.getShooter()), 0.0F);
+diff --git a/src/main/java/net/minecraft/server/EntityEnderPearl.java b/src/main/java/net/minecraft/server/EntityEnderPearl.java
+index 319c0bc6f621d54ca36e6e2b210a308122f1e070..319df81ac44b40a7d268a818974db212edecac16 100644
+--- a/src/main/java/net/minecraft/server/EntityEnderPearl.java
++++ b/src/main/java/net/minecraft/server/EntityEnderPearl.java
+@@ -21,6 +21,13 @@ public class EntityEnderPearl extends EntityProjectile {
+         this.loadChunks = world.paperSpigotConfig.loadUnloadedEnderPearls; // PaperSpigot
+     }
+ 
++    // VoidSoulSpigot start - configurable projectile trajectory randomness
++    @Override
++    protected double trajectoryRandomnessMultiplier() {
++        return this.world.voidsoulConfig.projectiles.pearlRandomness;
++    }
++    // VoidSoulSpigot end
++
+     protected void a(MovingObjectPosition movingobjectposition) {
+         EntityLiving entityliving = this.getShooter();
+ 
+@@ -71,9 +78,14 @@ public class EntityEnderPearl extends EntityProjectile {
+ 
+                         entityplayer.playerConnection.teleport(teleEvent.getTo());
+                         entityliving.fallDistance = 0.0F;
++                        // VoidSoulSpigot start - configurable ender pearl damage
++                        float pearlDamage = (float) this.world.voidsoulConfig.projectiles.pearlDamage;
++                        if (pearlDamage > 0.0F) {
+                         CraftEventFactory.entityDamage = this;
+-                        entityliving.damageEntity(DamageSource.FALL, 5.0F);
++                        entityliving.damageEntity(DamageSource.FALL, pearlDamage);
+                         CraftEventFactory.entityDamage = null;
++                        }
++                        // VoidSoulSpigot end
+                     }
+                     // CraftBukkit end
+                 }
+diff --git a/src/main/java/net/minecraft/server/EntityPotion.java b/src/main/java/net/minecraft/server/EntityPotion.java
+index fd174c346d0c31f6f4e3b724d84ca1df600d73ff..8f3a161010e6e4f850ac81ffe903e97ca1c31753 100644
+--- a/src/main/java/net/minecraft/server/EntityPotion.java
++++ b/src/main/java/net/minecraft/server/EntityPotion.java
+@@ -27,6 +27,13 @@ public class EntityPotion extends EntityProjectile {
+         this.item = itemstack;
+     }
+ 
++    // VoidSoulSpigot start - configurable projectile trajectory randomness
++    @Override
++    protected double trajectoryRandomnessMultiplier() {
++        return this.world.voidsoulConfig.projectiles.potionRandomness;
++    }
++    // VoidSoulSpigot end
++
+     public EntityPotion(World world, double d0, double d1, double d2, ItemStack itemstack) {
+         super(world, d0, d1, d2);
+         this.item = itemstack;
+diff --git a/src/main/java/net/minecraft/server/EntityProjectile.java b/src/main/java/net/minecraft/server/EntityProjectile.java
+index fba0c18c6e1128d2f627c176531e4afe54bcd7df..dcadb5605bde90b9ec32524513a8fb66025db6b5 100644
+--- a/src/main/java/net/minecraft/server/EntityProjectile.java
++++ b/src/main/java/net/minecraft/server/EntityProjectile.java
+@@ -56,15 +56,28 @@ public abstract class EntityProjectile extends Entity implements IProjectile {
+         return 0.0F;
+     }
+ 
++    // VoidSoulSpigot start - configurable projectile trajectory randomness
++    /**
++     * @return Multiplier for the random spread applied when this projectile is launched.
++     *         1.0 is vanilla behaviour, 0.0 makes the trajectory exact.
++     */
++    protected double trajectoryRandomnessMultiplier() {
++        return 1.0D;
++    }
++    // VoidSoulSpigot end
++
+     public void shoot(double d0, double d1, double d2, float f, float f1) {
+         float f2 = MathHelper.sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+ 
+         d0 /= (double) f2;
+         d1 /= (double) f2;
+         d2 /= (double) f2;
+-        d0 += this.random.nextGaussian() * 0.007499999832361937D * (double) f1;
+-        d1 += this.random.nextGaussian() * 0.007499999832361937D * (double) f1;
+-        d2 += this.random.nextGaussian() * 0.007499999832361937D * (double) f1;
++        // VoidSoulSpigot start - configurable projectile trajectory randomness
++        double randomness = 0.007499999832361937D * this.trajectoryRandomnessMultiplier();
++        d0 += this.random.nextGaussian() * randomness * (double) f1;
++        d1 += this.random.nextGaussian() * randomness * (double) f1;
++        d2 += this.random.nextGaussian() * randomness * (double) f1;
++        // VoidSoulSpigot end
+         d0 *= (double) f;
+         d1 *= (double) f;
+         d2 *= (double) f;
+diff --git a/src/main/java/net/minecraft/server/EntitySnowball.java b/src/main/java/net/minecraft/server/EntitySnowball.java
+index 4a59b744d335d8c2df1e2b08b57c6560ac727f0c..593ddd6fecea24fa5ed1fd7b1a9740efbd356cff 100644
+--- a/src/main/java/net/minecraft/server/EntitySnowball.java
++++ b/src/main/java/net/minecraft/server/EntitySnowball.java
+@@ -14,6 +14,13 @@ public class EntitySnowball extends EntityProjectile {
+         super(world, d0, d1, d2);
+     }
+ 
++    // VoidSoulSpigot start - configurable projectile trajectory randomness
++    @Override
++    protected double trajectoryRandomnessMultiplier() {
++        return this.world.voidsoulConfig.projectiles.snowballRandomness;
++    }
++    // VoidSoulSpigot end
++
+     @Override
+     protected void a(MovingObjectPosition movingobjectposition) {
+         if (movingobjectposition.entity != null) {

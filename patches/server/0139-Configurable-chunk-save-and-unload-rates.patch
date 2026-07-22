@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 10:02:35 -0500
+Subject: [PATCH] Configurable chunk save and unload rates
+
+- chunks.maxUnloadsPerTick: caps how many chunks are unloaded per tick
+  (vanilla/Spigot hardcode 100). Values <= 0 remove the limit.
+- chunks.maxAutosaveChunksPerPass: re-enables the vanilla incremental
+  autosave cap (24) that Spigot disabled, with a configurable limit
+  (default 200). Only the periodic autosave path saves with
+  flag == false, so shutdown saves, /save-all and Bukkit World.save()
+  are never capped. Chunks that don't fit in one pass are picked up on
+  following passes since saved chunks are no longer dirty.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index a99b61fa8e3f40705dc076d893f6ad11f0d91f40..b2891335977fa58ac0232eb1a985eda24af04a50 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -68,4 +68,37 @@ public class VoidSoulWorldConfig {
+                 "Vanilla: 5.0. Set to 0 to disable pearl damage.")
+         public double pearlDamage = 5.0;
+     }
++
++    @Comment("Chunk system performance settings.")
++    public ChunksConfig chunks;
++
++    @ConfigSerializable
++    public static class ChunksConfig {
++        @Comment("Maximum number of chunks unloaded per tick. Vanilla/Spigot: 100.\n" +
++                "Lower values spread unload work across more ticks, reducing lag spikes\n" +
++                "when many chunks unload at once (for example after players teleport\n" +
++                "away). Values <= 0 remove the limit entirely.")
++        public int maxUnloadsPerTick = 100;
++
++        @Comment("Maximum number of chunks written per periodic auto-save pass.\n" +
++                "Spigot removes the vanilla cap (24) and writes every dirty chunk in one\n" +
++                "go, which causes lag spikes on busy servers. Chunks that don't fit in\n" +
++                "one pass are saved on the following passes, and unloads/shutdown always\n" +
++                "save everything. Set to 0 for the unlimited Spigot behaviour.")
++        public int maxAutosaveChunksPerPass = 200;
++    }
++
++    @Comment("Toggles for per-tick systems. Disabling a system stops its processing\n" +
++            "entirely in this world, which can significantly help TPS on PvP or\n" +
++            "minigame servers that don't need it.")
++    public TickingConfig ticking;
++
++    @ConfigSerializable
++    public static class TickingConfig {
++        public boolean tickHoppers = true;
++        public boolean tickFurnaces = true;
++        public boolean tickBrewingStands = true;
++        public boolean tickBeacons = true;
++        public boolean tickVillages = true;
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 041ede2857ddcc6fc8a4f52318ef4ba9d975782a..6165395926740636b34f9223d6d5418cf07292e2 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -337,6 +337,11 @@ public class ChunkProviderServer implements IChunkProvider {
+ 
+     public boolean saveChunks(boolean flag, IProgressUpdate iprogressupdate) {
+         int i = 0;
++        // VoidSoulSpigot start - re-enable the vanilla incremental autosave cap, with a configurable limit
++        // The only path that saves with flag == false is Spigot's periodic autosave; every
++        // other save (shutdown, /save-all, Bukkit World.save()) uses flag == true and is never capped.
++        int maxChunks = this.world.voidsoulConfig.chunks.maxAutosaveChunksPerPass;
++        // VoidSoulSpigot end
+ 
+         // CraftBukkit start
+         Iterator iterator = this.chunks.values().iterator();
+@@ -355,6 +360,11 @@ public class ChunkProviderServer implements IChunkProvider {
+                 if (i == 24 && !flag && false) { // Spigot
+                     return false;
+                 }
++                // VoidSoulSpigot start - incremental autosave: cap chunks written per pass
++                if (!flag && maxChunks > 0 && i >= maxChunks) {
++                    return false;
++                }
++                // VoidSoulSpigot end
+             }
+         }
+ 
+@@ -372,7 +382,10 @@ public class ChunkProviderServer implements IChunkProvider {
+         if (!this.world.savingDisabled) {
+             // CraftBukkit start
+             Server server = this.world.getServer();
+-            for (int i = 0; i < 100 && !this.unloadQueue.isEmpty(); ++i) {
++            // VoidSoulSpigot start - configurable chunk unload rate
++            int maxUnloads = this.world.voidsoulConfig.chunks.maxUnloadsPerTick;
++            if (maxUnloads <= 0) maxUnloads = Integer.MAX_VALUE;
++            for (int i = 0; i < maxUnloads && !this.unloadQueue.isEmpty(); ++i) { // VoidSoulSpigot end
+                 long chunkcoordinates = this.unloadQueue.popFirst();
+                 Chunk chunk = this.chunks.get(chunkcoordinates);
+                 if (chunk == null) continue;

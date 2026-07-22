@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 09:56:16 -0500
+Subject: [PATCH] Configurable hit delay
+
+Adds combat.hitDelayTicks to voidsoul.yml, which controls the amount of
+invulnerability ticks an entity has after taking damage (vanilla: 20).
+Applied on entity construction; plugins can still override the value
+per-entity through maxNoDamageTicks.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index be9e325981b82407ce8de1489d50d0befaa4c479..874d7fe74dd08707a5ee5472dff061002e3a983d 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -6,6 +6,17 @@ import org.spongepowered.configurate.objectmapping.meta.Comment;
+ @ConfigSerializable
+ @SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
+ public class VoidSoulWorldConfig {
++    @Comment("Combat behaviour settings.")
++    public CombatConfig combat;
++
++    @ConfigSerializable
++    public static class CombatConfig {
++        @Comment("How many ticks of invulnerability an entity has after being damaged.\n" +
++                "Vanilla: 20. Lower values make fights faster-paced.\n" +
++                "Plugins can still override this per-entity (maxNoDamageTicks).")
++        public int hitDelayTicks = 20;
++    }
++
+     @Comment("These options control the velocity players receive when damaged, as well\n" +
+             "as fishing rod knockback. This section supersedes the \"knockback\"\n" +
+             "section that previously lived in pandaspigot.yml.")
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index bc19ea170e40dfee33bb88cb3cca0de3fe715158..27f17d28cd21bfb312a0ac53b2f3fb51eec54a20 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -108,6 +108,11 @@ public abstract class EntityLiving extends Entity {
+ 
+     public EntityLiving(World world) {
+         super(world);
++        // VoidSoulSpigot start - configurable hit delay
++        if (world != null && world.voidsoulConfig != null) {
++            this.maxNoDamageTicks = world.voidsoulConfig.combat.hitDelayTicks;
++        }
++        // VoidSoulSpigot end
+         this.initAttributes();
+         // CraftBukkit - setHealth(getMaxHealth()) inlined and simplified to skip the instanceof check for EntityPlayer, as getBukkitEntity() is not initialized in constructor
+         this.datawatcher.watch(6, (float) this.getAttributeInstance(GenericAttributes.maxHealth).getValue());

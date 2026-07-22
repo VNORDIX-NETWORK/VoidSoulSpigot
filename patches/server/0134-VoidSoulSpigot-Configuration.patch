@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 09:54:35 -0500
+Subject: [PATCH] VoidSoulSpigot Configuration
+
+Adds voidsoul.yml, VoidSoulSpigot's own configuration file, with support
+for per-world sections like pandaspigot.yml. Also makes the server brand
+name configurable (serverBrandName).
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..85cad5bdfc2336bbc388702c62b1d3c473269c27
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -0,0 +1,108 @@
++package com.voidsoul.spigot.config;
++
++import com.google.common.base.Throwables;
++import com.hpfxd.configurate.eoyaml.EOYamlConfigurationLoader;
++import net.minecraft.server.World;
++import org.spongepowered.configurate.CommentedConfigurationNode;
++import org.spongepowered.configurate.ConfigurationNode;
++import org.spongepowered.configurate.objectmapping.ConfigSerializable;
++import org.spongepowered.configurate.objectmapping.ObjectMapper;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++import org.spongepowered.configurate.util.MapFactories;
++import org.spongepowered.configurate.util.NamingSchemes;
++
++import java.io.File;
++import java.util.HashMap;
++import java.util.Map;
++
++@ConfigSerializable
++@SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
++public class VoidSoulConfig {
++    private static VoidSoulConfig config;
++    private static VoidSoulWorldConfig defaultWorldConfig;
++    private static final Map<String, VoidSoulWorldConfig> worldConfigs = new HashMap<>();
++
++    /**
++     * Initialize the configuration, and load it from a file.
++     * <p>
++     * This is called once on server startup, and every reload.
++     *
++     * @param file The configuration file.
++     */
++    public static void init(File file) {
++        EOYamlConfigurationLoader loader = EOYamlConfigurationLoader.builder()
++                .file(file)
++                .defaultOptions(o -> o
++                        .header("This is the configuration file for VoidSoulSpigot.\n" +
++                                "VoidSoulSpigot is a fork of PandaSpigot focused on chunk performance and PvP mechanics.\n" +
++                                "Use caution when modifying settings, as some may impact gameplay in non-obvious ways.")
++                        .mapFactory(MapFactories.insertionOrdered())
++                        .serializers(build -> build.registerAnnotatedObjects(ObjectMapper.factoryBuilder()
++                                .defaultNamingScheme(NamingSchemes.CAMEL_CASE)
++                                .build())))
++                .build();
++
++        try {
++            CommentedConfigurationNode root = loader.load();
++            config = root.get(VoidSoulConfig.class);
++
++            // worlds
++            CommentedConfigurationNode worldsNode = root.node("worlds")
++                    .comment("The worlds section is for settings which can be configured per-world.\n" +
++                            "\n" +
++                            "Any settings in the \"default\" world will provide default values for\n" +
++                            "other worlds which don't explicitly specify settings.\n" +
++                            "\n" +
++                            "To specify settings for a specific world, just add a new section with the world's name.");
++            ConfigurationNode defaultWorldNode = worldsNode.node("default");
++            defaultWorldConfig = defaultWorldNode.get(VoidSoulWorldConfig.class);
++            defaultWorldNode.set(defaultWorldConfig); // populate default in config
++
++            root.set(config); // update backing node
++            loader.save(root);
++
++            // call after save
++            initWorlds(worldsNode);
++        } catch (Exception e) {
++            throw Throwables.propagate(e);
++        }
++    }
++
++    private static void initWorlds(ConfigurationNode node) throws Exception {
++        worldConfigs.clear();
++        for (Map.Entry<Object, ? extends ConfigurationNode> entry : node.childrenMap().entrySet()) {
++            Object worldName = entry.getKey();
++            if (worldName.equals("default")) continue; // skip "default"
++            ConfigurationNode worldNode = entry.getValue();
++
++            VoidSoulWorldConfig worldConfig = worldNode.get(VoidSoulWorldConfig.class);
++
++            worldConfigs.put(worldName.toString(), worldConfig);
++        }
++    }
++
++    public static VoidSoulWorldConfig getWorldConfig(String worldName) {
++        return worldConfigs.getOrDefault(worldName, defaultWorldConfig);
++    }
++
++    public static VoidSoulWorldConfig getWorldConfig(World world) {
++        return getWorldConfig(world.worldData.getName());
++    }
++
++    public static VoidSoulConfig get() {
++        return config;
++    }
++
++    /**
++     * @return The configured server brand name. Safe to call before the config is loaded.
++     */
++    public static String getServerBrandName() {
++        return config != null && config.serverBrandName != null ? config.serverBrandName : "VoidSoulSpigot";
++    }
++
++    //------------------------------------------------------------------------
++
++    @Comment("The server brand name shown in the client's F3 screen, in the /version command,\n" +
++            "and used as the server name by plugins.")
++    public String serverBrandName = "VoidSoulSpigot";
++}
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..a623d5b38ee97571fc6eb4cd507f361c6acf934e
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -0,0 +1,9 @@
++package com.voidsoul.spigot.config;
++
++import org.spongepowered.configurate.objectmapping.ConfigSerializable;
++import org.spongepowered.configurate.objectmapping.meta.Comment;
++
++@ConfigSerializable
++@SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
++public class VoidSoulWorldConfig {
++}
+diff --git a/src/main/java/net/minecraft/server/DedicatedServer.java b/src/main/java/net/minecraft/server/DedicatedServer.java
+index 0f4e8c767632430a4cda8905331e6cede4351566..da8afb9d376a38638de154239307328b476f5a62 100644
+--- a/src/main/java/net/minecraft/server/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/DedicatedServer.java
+@@ -211,6 +211,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             }
+             com.hpfxd.pandaspigot.config.PandaSpigotConfig.init((File) options.valueOf("pandaspigot-settings"));
+             // PandaSpigot end
++            com.voidsoul.spigot.config.VoidSoulConfig.init((File) options.valueOf("voidsoul-settings")); // VoidSoulSpigot
+             // PaperSpigot start
+             org.github.paperspigot.PaperSpigotConfig.init((File) options.valueOf("paper-settings"));
+             org.github.paperspigot.PaperSpigotConfig.registerCommands();
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 548105371dece1a6fd08a7286a5496238d265f9d..16fe00fa6faac9e2894b7b9b5a1f4b5256629bf2 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -1173,7 +1173,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+     }
+ 
+     public String getServerModName() {
+-        return "VoidSoulSpigot"; // VoidSoulSpigot - VoidSoulSpigot > // PandaSpigot - PandaSpigot > // PaperSpigot - PaperSpigot > // Spigot - Spigot > // CraftBukkit - cb > vanilla!
++        return com.voidsoul.spigot.config.VoidSoulConfig.getServerBrandName(); // VoidSoulSpigot - configurable brand // PandaSpigot - PandaSpigot > // PaperSpigot - PaperSpigot > // Spigot - Spigot > // CraftBukkit - cb > vanilla!
+     }
+ 
+     public CrashReport b(CrashReport crashreport) {
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index 522c63e7f884a8b2202b111c81df9b54384703d5..fcb7ceecf753bbfdb2d1b1c15330159c38cf253a 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -169,6 +169,8 @@ public abstract class World implements IBlockAccess {
+ 
+     public com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig pandaSpigotConfig; // PandaSpigot
+ 
++    public com.voidsoul.spigot.config.VoidSoulWorldConfig voidsoulConfig; // VoidSoulSpigot
++
+     public final co.aikar.timings.WorldTimingsHandler timings; // Spigot
+ 
+     public CraftWorld getWorld() {
+@@ -193,6 +195,7 @@ public abstract class World implements IBlockAccess {
+         this.spigotConfig = new org.spigotmc.SpigotWorldConfig( worlddata.getName() ); // Spigot
+         this.paperSpigotConfig = new org.github.paperspigot.PaperSpigotWorldConfig( worlddata.getName() ); // PaperSpigot
+         this.pandaSpigotConfig = com.hpfxd.pandaspigot.config.PandaSpigotConfig.getWorldConfig(worlddata.getName()); // PandaSpigot
++        this.voidsoulConfig = com.voidsoul.spigot.config.VoidSoulConfig.getWorldConfig(worlddata.getName()); // VoidSoulSpigot
+         this.generator = gen;
+         this.world = new CraftWorld((WorldServer) this, gen, env);
+         this.ticksPerAnimalSpawns = this.getServer().getTicksPerAnimalSpawns(); // CraftBukkit
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 191043664efad2ef3ae8f574eb72ffc7ec25089e..81ef1618772493119129f3dc7b8c5f2d7cd5843c 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -127,7 +127,7 @@ import net.md_5.bungee.api.chat.BaseComponent;
+ 
+ public final class CraftServer implements Server {
+     private static final Player[] EMPTY_PLAYER_ARRAY = new Player[0];
+-    private final String serverName = "VoidSoulSpigot"; // VoidSoulSpigot // PandaSpigot
++    private final String serverName = com.voidsoul.spigot.config.VoidSoulConfig.getServerBrandName(); // VoidSoulSpigot - configurable brand // PandaSpigot
+     private final String serverVersion;
+     private final String bukkitVersion = Versioning.getBukkitVersion();
+     private final Logger logger = Logger.getLogger("Minecraft");
+@@ -749,6 +749,7 @@ public final class CraftServer implements Server {
+         org.spigotmc.SpigotConfig.init((File) console.options.valueOf("spigot-settings")); // Spigot
+         org.github.paperspigot.PaperSpigotConfig.init((File) console.options.valueOf("paper-settings")); // PaperSpigot
+         com.hpfxd.pandaspigot.config.PandaSpigotConfig.init((File) console.options.valueOf("pandaspigot-settings")); // PandaSpigot
++        com.voidsoul.spigot.config.VoidSoulConfig.init((File) console.options.valueOf("voidsoul-settings")); // VoidSoulSpigot
+         for (WorldServer world : console.worlds) {
+             world.worldData.setDifficulty(difficulty);
+             world.setSpawnFlags(monsters, animals);
+@@ -766,6 +767,7 @@ public final class CraftServer implements Server {
+             world.spigotConfig.init(); // Spigot
+             world.paperSpigotConfig.init(); // PaperSpigot
+             world.pandaSpigotConfig = com.hpfxd.pandaspigot.config.PandaSpigotConfig.getWorldConfig(world); // PandaSpigot
++            world.voidsoulConfig = com.voidsoul.spigot.config.VoidSoulConfig.getWorldConfig(world); // VoidSoulSpigot
+         }
+ 
+         pluginManager.clearPlugins();
+diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
+index d8d19207e4db256befa886bc9638759ed7c926dc..a628a036a7a99ae99519e40315f3696d9fed6e43 100644
+--- a/src/main/java/org/bukkit/craftbukkit/Main.java
++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
+@@ -140,6 +140,14 @@ public class Main {
+                         .defaultsTo(new File("pandaspigot.yml"))
+                         .describedAs("Yml file");
+ 
++                // VoidSoulSpigot start
++                acceptsAll(asList("voidsoul-settings"), "File for VoidSoulSpigot settings")
++                        .withRequiredArg()
++                        .ofType(File.class)
++                        .defaultsTo(new File("voidsoul.yml"))
++                        .describedAs("Yml file");
++                // VoidSoulSpigot end
++
+                 acceptsAll(asList("add-plugin", "add-extra-plugin-jar"), "Specify paths to extra plugin jars to be loaded in addition to those in the plugins folder. This argument can be specified multiple times, once for each extra plugin jar path.")
+                     .withRequiredArg()
+                     .ofType(File.class)

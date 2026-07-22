@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 10:03:22 -0500
+Subject: [PATCH] Per-world ticking toggles
+
+Adds ticking.{tickHoppers,tickFurnaces,tickBrewingStands,tickBeacons,
+tickVillages} to voidsoul.yml. Disabling a system skips its processing
+entirely for that world, which helps TPS on PvP/minigame servers that
+don't need those mechanics.
+
+Furnaces and brewing stands keep their wall-time clock in sync while
+disabled so re-enabling them doesn't fast-forward progress.
+
+diff --git a/src/main/java/net/minecraft/server/TileEntityBeacon.java b/src/main/java/net/minecraft/server/TileEntityBeacon.java
+index f4717af7d1a430dab45c5c8c368fd26c4fd73cb2..86b8cfc62bec71dfb90618770114d47d0546a11a 100644
+--- a/src/main/java/net/minecraft/server/TileEntityBeacon.java
++++ b/src/main/java/net/minecraft/server/TileEntityBeacon.java
+@@ -56,6 +56,7 @@ public class TileEntityBeacon extends TileEntityContainer implements IUpdatePlay
+     public TileEntityBeacon() {}
+ 
+     public void c() {
++        if (this.world != null && !this.world.voidsoulConfig.ticking.tickBeacons) return; // VoidSoulSpigot - toggleable beacon ticking
+         if (this.world.getTime() % 80L == 0L) {
+             this.m();
+         }
+diff --git a/src/main/java/net/minecraft/server/TileEntityBrewingStand.java b/src/main/java/net/minecraft/server/TileEntityBrewingStand.java
+index 07d5a196796cab764e9c55e205b9ee81beed6df6..a710729d3c597161b9b4e752ead9a6eda851cb1b 100644
+--- a/src/main/java/net/minecraft/server/TileEntityBrewingStand.java
++++ b/src/main/java/net/minecraft/server/TileEntityBrewingStand.java
+@@ -64,6 +64,12 @@ public class TileEntityBrewingStand extends TileEntityContainer implements IUpda
+     }
+ 
+     public void c() {
++        // VoidSoulSpigot start - toggleable brewing stand ticking
++        if (this.world != null && !this.world.voidsoulConfig.ticking.tickBrewingStands) {
++            this.lastTick = MinecraftServer.currentTick; // keep wall-time clock in sync so re-enabling doesn't fast-forward
++            return;
++        }
++        // VoidSoulSpigot end
+         // CraftBukkit start - Use wall time instead of ticks for brewing
+         int elapsedTicks = MinecraftServer.currentTick - this.lastTick;
+         this.lastTick = MinecraftServer.currentTick;
+diff --git a/src/main/java/net/minecraft/server/TileEntityFurnace.java b/src/main/java/net/minecraft/server/TileEntityFurnace.java
+index 0e3f35a6eee539511f996687d36e5bfe160c1751..83aa8071e70bdcd9bfccbbeea4d29f0728ffdc46 100644
+--- a/src/main/java/net/minecraft/server/TileEntityFurnace.java
++++ b/src/main/java/net/minecraft/server/TileEntityFurnace.java
+@@ -176,6 +176,12 @@ public class TileEntityFurnace extends TileEntityContainer implements IUpdatePla
+     }
+ 
+     public void c() {
++        // VoidSoulSpigot start - toggleable furnace ticking
++        if (this.world != null && !this.world.voidsoulConfig.ticking.tickFurnaces) {
++            this.lastTick = MinecraftServer.currentTick; // keep wall-time clock in sync so re-enabling doesn't fast-forward
++            return;
++        }
++        // VoidSoulSpigot end
+         boolean flag = (this.w() == Blocks.LIT_FURNACE); // CraftBukkit - SPIGOT-844 - Check if furnace block is lit using the block instead of burn time // PAIL: Rename
+         boolean flag1 = false;
+ 
+diff --git a/src/main/java/net/minecraft/server/TileEntityHopper.java b/src/main/java/net/minecraft/server/TileEntityHopper.java
+index 760a0767eae7c148efd27c78a4a2f142507b75b7..bb386127407b5b07d5ec4d064c5c9e5f0fead46d 100644
+--- a/src/main/java/net/minecraft/server/TileEntityHopper.java
++++ b/src/main/java/net/minecraft/server/TileEntityHopper.java
+@@ -171,6 +171,7 @@ public class TileEntityHopper extends TileEntityContainer implements IHopper, IU
+ 
+     public void c() {
+         if (this.world != null && !this.world.isClientSide) {
++            if (!this.world.voidsoulConfig.ticking.tickHoppers) return; // VoidSoulSpigot - toggleable hopper ticking
+             --this.g;
+             if (!this.n()) {
+                 this.d(0);
+diff --git a/src/main/java/net/minecraft/server/WorldServer.java b/src/main/java/net/minecraft/server/WorldServer.java
+index 1c9e429b4107daf0991fe0c61bd5377cf4c22c95..89cec1bb96df4e4716452cbec12f88a79a90865e 100644
+--- a/src/main/java/net/minecraft/server/WorldServer.java
++++ b/src/main/java/net/minecraft/server/WorldServer.java
+@@ -261,8 +261,11 @@ public class WorldServer extends World implements IAsyncTaskHandler {
+         timings.doChunkMap.stopTiming(); // Spigot
+         this.methodProfiler.c("village");
+         timings.doVillages.startTiming(); // Spigot
++        // VoidSoulSpigot start - toggleable village ticking
++        if (this.voidsoulConfig.ticking.tickVillages) {
+         this.villages.tick();
+         this.siegeManager.a();
++        } // VoidSoulSpigot end
+         timings.doVillages.stopTiming(); // Spigot
+         this.methodProfiler.c("portalForcer");
+         timings.doPortalForcer.startTiming(); // Spigot

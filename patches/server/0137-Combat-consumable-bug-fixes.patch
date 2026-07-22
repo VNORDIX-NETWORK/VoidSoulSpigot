@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 09:57:17 -0500
+Subject: [PATCH] Combat consumable bug fixes
+
+Two configurable fixes for 1.8 combat exploits:
+- combat.fixEatWhileSprinting: forces sprint off while a player is
+  consuming food, a potion or milk. Sword blocking and bow drawing are
+  unaffected so block-hitting keeps working.
+- combat.fixDropEatDesync: releases the item in use when the player
+  drops it, preventing the drop-eat desync.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 874d7fe74dd08707a5ee5472dff061002e3a983d..605c60fa806dde7644753fa7248e768f50c3c550 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -15,6 +15,15 @@ public class VoidSoulWorldConfig {
+                 "Vanilla: 20. Lower values make fights faster-paced.\n" +
+                 "Plugins can still override this per-entity (maxNoDamageTicks).")
+         public int hitDelayTicks = 20;
++
++        @Comment("Prevents players from keeping sprint while consuming food, potions or\n" +
++                "milk (the \"run and eat\" exploit). Sword blocking and bow drawing are\n" +
++                "not affected, so block-hitting keeps working.")
++        public boolean fixEatWhileSprinting = true;
++
++        @Comment("Releases the item a player is consuming when they drop it, preventing\n" +
++                "a desync where the player appears to keep eating.")
++        public boolean fixDropEatDesync = true;
+     }
+ 
+     @Comment("These options control the velocity players receive when damaged, as well\n" +
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 3d123e35ec6d8a3fd02d6b0af1c0ca8af9bb5799..91fccca78e44625c0a502197ff9c09933d553628 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -132,6 +132,14 @@ public abstract class EntityHuman extends EntityLiving {
+         }
+ 
+         if (this.g != null) {
++            // VoidSoulSpigot start - prevent sprinting while consuming items
++            if (!this.world.isClientSide && this.isSprinting() && this.world.voidsoulConfig.combat.fixEatWhileSprinting) {
++                Item usingItem = this.g.getItem();
++                if (usingItem instanceof ItemFood || usingItem instanceof ItemPotion || usingItem instanceof ItemMilkBucket) {
++                    this.setSprinting(false);
++                }
++            }
++            // VoidSoulSpigot end
+             ItemStack itemstack = this.inventory.getItemInHand();
+ 
+             if (itemstack == this.g) {
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index a4c9ee61ca31700b35250cb014f31ffc413cbf8c..f1a611889c487ee27a73798488c82699d2807883 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -622,6 +622,11 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     }
+                 }
+                 // CraftBukkit end
++                // VoidSoulSpigot start - fix drop-eat desync: release the item being consumed when it is dropped
++                if (this.player.world.voidsoulConfig.combat.fixDropEatDesync && this.player.bS()) {
++                    this.player.bV();
++                }
++                // VoidSoulSpigot end
+                 this.player.a(false);
+             }
+ 

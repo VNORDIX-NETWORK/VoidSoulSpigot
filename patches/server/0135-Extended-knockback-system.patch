@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 22 Jul 2026 09:55:44 -0500
+Subject: [PATCH] Extended knockback system
+
+Moves knockback configuration to voidsoul.yml and extends it:
+- slowdown: multiplier applied to the attacker's motion on a knockback
+  hit (vanilla hardcodes 0.6)
+- rodHorizontalMultiplier/rodVerticalMultiplier: scale the velocity an
+  entity receives when hit by a fishing rod hook
+
+The old knockback section in pandaspigot.yml is removed; defaults match
+vanilla behaviour.
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+index fc00a5f67c5a6b2642c23834da1bef31338e2f07..4d66251ee90cc24c67a304fb6ab9b7797118366f 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotWorldConfig.java
+@@ -37,18 +37,7 @@ public class PandaSpigotWorldConfig {
+             "By default, this is true (vanilla behaviour)")
+     public boolean randomArrowTrajectory = true;
+     
+-    @Comment("These options control velocity players receive when damaged.")
+-    public KnockbackConfig knockback;
+-    
+-    @ConfigSerializable
+-    public static class KnockbackConfig {
+-        public double friction = 2.0;
+-        public double horizontal = 0.4;
+-        public double vertical = 0.4;
+-        public double verticalLimit = 0.4000000059604645;
+-        public double extraHorizontal = 0.5;
+-        public double extraVertical = 0.1;
+-    }
++    // VoidSoulSpigot - moved knockback configuration to voidsoul.yml
+ 
+     public boolean optimizeTntMovement = false; // May not fully emulate vanilla behavior
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index a623d5b38ee97571fc6eb4cd507f361c6acf934e..be9e325981b82407ce8de1489d50d0befaa4c479 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -6,4 +6,28 @@ import org.spongepowered.configurate.objectmapping.meta.Comment;
+ @ConfigSerializable
+ @SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
+ public class VoidSoulWorldConfig {
++    @Comment("These options control the velocity players receive when damaged, as well\n" +
++            "as fishing rod knockback. This section supersedes the \"knockback\"\n" +
++            "section that previously lived in pandaspigot.yml.")
++    public KnockbackConfig knockback;
++
++    @ConfigSerializable
++    public static class KnockbackConfig {
++        public double friction = 2.0;
++        public double horizontal = 0.4;
++        public double vertical = 0.4;
++        public double verticalLimit = 0.4000000059604645;
++        public double extraHorizontal = 0.5;
++        public double extraVertical = 0.1;
++
++        @Comment("Multiplier applied to the attacker's motion after landing a hit that\n" +
++                "deals extra knockback (sprint hit or Knockback enchantment).\n" +
++                "Vanilla: 0.6 (lower values slow the attacker down more)")
++        public double slowdown = 0.6;
++
++        @Comment("Multipliers applied to the velocity an entity receives when hit by a\n" +
++                "fishing rod hook. 1.0 is vanilla behaviour.")
++        public double rodHorizontalMultiplier = 1.0;
++        public double rodVerticalMultiplier = 1.0;
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityFishingHook.java b/src/main/java/net/minecraft/server/EntityFishingHook.java
+index 6eca198f9f026c82b8b31d446c3953dabdc956cf..338715235d1197c9c0b99fa9819190be1bb738f0 100644
+--- a/src/main/java/net/minecraft/server/EntityFishingHook.java
++++ b/src/main/java/net/minecraft/server/EntityFishingHook.java
+@@ -209,6 +209,15 @@ public class EntityFishingHook extends Entity {
+                 if (movingobjectposition.entity != null) {
+                     if (movingobjectposition.entity.damageEntity(DamageSource.projectile(this, this.owner), 0.0F)) {
+                         this.hooked = movingobjectposition.entity;
++                        // VoidSoulSpigot start - configurable rod knockback
++                        com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = this.world.voidsoulConfig.knockback;
++                        if (knockbackConfig.rodHorizontalMultiplier != 1.0D || knockbackConfig.rodVerticalMultiplier != 1.0D) {
++                            this.hooked.motX *= knockbackConfig.rodHorizontalMultiplier;
++                            this.hooked.motZ *= knockbackConfig.rodHorizontalMultiplier;
++                            this.hooked.motY *= knockbackConfig.rodVerticalMultiplier;
++                            this.hooked.velocityChanged = true;
++                        }
++                        // VoidSoulSpigot end
+                     }
+                 } else {
+                     this.as = true;
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 524ff60ada7392ec1fd803661f957c19c50b2c2e..3d123e35ec6d8a3fd02d6b0af1c0ca8af9bb5799 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -1011,15 +1011,15 @@ public abstract class EntityHuman extends EntityLiving {
+ 
+                     if (flag2) {
+                         if (i > 0) {
+-                            // PandaSpigot start - Configurable knockback
+-                            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = entity.world.pandaSpigotConfig.knockback;
++                            // PandaSpigot start - Configurable knockback // VoidSoulSpigot - moved to voidsoul.yml, configurable slowdown
++                            com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = entity.world.voidsoulConfig.knockback;
+                             entity.g(
+                                     -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal,
+                                     knockbackConfig.extraVertical,
+                                     MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal);
+                             // PandaSpigot end
+-                            this.motX *= 0.6D;
+-                            this.motZ *= 0.6D;
++                            this.motX *= knockbackConfig.slowdown; // VoidSoulSpigot - configurable slowdown
++                            this.motZ *= knockbackConfig.slowdown; // VoidSoulSpigot - configurable slowdown
+                             this.setSprinting(false);
+                         }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 32752dfad24bc7883b1ab52e29834f1aa6fa60c6..bc19ea170e40dfee33bb88cb3cca0de3fe715158 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -897,8 +897,8 @@ public abstract class EntityLiving extends Entity {
+     public void a(Entity entity, float f, double d0, double d1) {
+         if (this.random.nextDouble() >= this.getAttributeInstance(GenericAttributes.c).getValue()) {
+             this.ai = true;
+-            // PandaSpigot start - Configurable knockback
+-            com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig.KnockbackConfig knockbackConfig = entity.world.pandaSpigotConfig.knockback;
++            // PandaSpigot start - Configurable knockback // VoidSoulSpigot - moved to voidsoul.yml
++            com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = entity.world.voidsoulConfig.knockback;
+             double magnitude = MathHelper.sqrt(d0 * d0 + d1 * d1);
+     
+             double friction = knockbackConfig.friction;

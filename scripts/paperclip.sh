@@ -11,7 +11,7 @@ basedir="$(cd "$1" && pwd -P)"
     echo "Failed to build Paperclip jar."
     exit 1
 ) || exit 1
-cp -v "$basedir/paperclip/build/libs/paperclip-1.8.8-R0.1-SNAPSHOT.jar" "$basedir/paperclip.jar"
+cp -v "$basedir/paperclip/build/libs/paperclip-1.8.8-R0.1-SNAPSHOT.jar" "$basedir/VoidSoulSpigot-paperclip.jar"
 
 echo ""
 echo ""
