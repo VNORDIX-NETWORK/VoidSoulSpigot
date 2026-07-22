@@ -1,0 +1,17 @@
+/.idea/
+/base/mc-dev/
+/PandaSpigot-API/
+/PandaSpigot-Server/
+
+# VoidSoulSpigot - local reference material (not part of the fork)
+/Source/
+/Cosas que me gustaria implementar/
+*.iml
+*.DS_Store
+run/
+
+# gradle
+.gradle/
+build/
+
+paperclip.jar
