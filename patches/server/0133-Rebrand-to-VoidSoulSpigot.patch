@@ -6,6 +6,19 @@ Subject: [PATCH] Rebrand to VoidSoulSpigot
 Changes the server brand shown to clients (F3), the CraftServer name
 used by plugins/logs, and the watchdog messages.
 
+diff --git a/build.gradle.kts b/build.gradle.kts
+index e9df20a48afde91bc88c653be4db02a17d4c475b..19c13d9d880f8a328427ebbfa1cd901e9481ead6 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -115,7 +115,7 @@ tasks {
+             attributes(
+                 "Main-Class" to "org.bukkit.craftbukkit.Main",
+                 "Implementation-Title" to "CraftBukkit",
+-                "Implementation-Version" to "git-PandaSpigot-$implementationVersion",
++                "Implementation-Version" to "git-VoidSoulSpigot-$implementationVersion", // VoidSoulSpigot
+                 "Implementation-Vendor" to date,
+                 "Specification-Title" to "Bukkit",
+                 "Specification-Version" to project.version,
 diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
 index ae0259e025d1121adb5d09cda05e84fe711d8a35..548105371dece1a6fd08a7286a5496238d265f9d 100644
 --- a/src/main/java/net/minecraft/server/MinecraftServer.java
