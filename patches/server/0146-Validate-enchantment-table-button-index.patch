@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:49:35 -0500
+Subject: [PATCH] Validate enchantment table button index
+
+The button index in PacketPlayInEnchantItem comes straight from the client
+and is used to index the three element costs array, so any other value
+makes the handler throw ArrayIndexOutOfBoundsException.
+
+diff --git a/src/main/java/net/minecraft/server/ContainerEnchantTable.java b/src/main/java/net/minecraft/server/ContainerEnchantTable.java
+index 5c473bef9a9fa2700ac665f17f4af84add29db2e..6d1aefeeeb6cd5d90751aeb7db7099e640b594d7 100644
+--- a/src/main/java/net/minecraft/server/ContainerEnchantTable.java
++++ b/src/main/java/net/minecraft/server/ContainerEnchantTable.java
+@@ -194,6 +194,12 @@ public class ContainerEnchantTable extends Container {
+     }
+ 
+     public boolean a(EntityHuman entityhuman, int i) {
++        // VoidSoulSpigot start - the button index comes straight from the client and is
++        // used to index a three element array, so anything else must be rejected
++        if (i < 0 || i >= this.costs.length) {
++            return false;
++        }
++        // VoidSoulSpigot end
+         ItemStack itemstack = this.enchantSlots.getItem(0);
+         ItemStack itemstack1 = this.enchantSlots.getItem(1);
+         int j = i + 1;

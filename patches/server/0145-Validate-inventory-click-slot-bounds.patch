@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:49:35 -0500
+Subject: [PATCH] Validate inventory click slot bounds
+
+The slot in PacketPlayInWindowClick is a signed short read straight off the
+wire, and only the lower bound was checked. Several click modes in
+Container#clickItem index the slot list with it unchecked, so a crafted
+packet makes the handler throw IndexOutOfBoundsException on the main
+thread. That is caught and logged with a full stack trace per packet, so
+spamming it floods the log and the disk.
+
+Rejects slots outside the open container in the packet handler, and adds
+the same bound inside clickItem for callers that reach it another way.
+
+diff --git a/src/main/java/net/minecraft/server/Container.java b/src/main/java/net/minecraft/server/Container.java
+index 486b940be465128462aeb1007c63165a4ef8e8f7..0278f21122dfc564b112279125ac5e9764c24dbf 100644
+--- a/src/main/java/net/minecraft/server/Container.java
++++ b/src/main/java/net/minecraft/server/Container.java
+@@ -116,6 +116,14 @@ public abstract class Container {
+     }
+ 
+     public ItemStack clickItem(int i, int j, int k, EntityHuman entityhuman) {
++        // VoidSoulSpigot start - defence in depth against out of range slots.
++        // Several click modes below index the slot list with the raw slot number from
++        // the packet, some of them without even a lower bound. -1 and -999 are the
++        // "outside the window" markers and stay valid.
++        if (i != -1 && i != -999 && (i < 0 || i >= this.c.size())) {
++            return null;
++        }
++        // VoidSoulSpigot end
+         ItemStack itemstack = null;
+         PlayerInventory playerinventory = entityhuman.inventory;
+         int l;
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index f1a611889c487ee27a73798488c82699d2807883..e2bdac9a7050df45059c25442ceb320eb9f17ba1 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1498,6 +1498,15 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     return;
+                 }
+ 
++                // VoidSoulSpigot start - reject clicks on slots outside the open container.
++                // The slot is a signed short straight off the wire, and several click modes
++                // index the slot list with it unchecked, so a crafted packet can spam
++                // IndexOutOfBoundsException from the packet handler.
++                if (packetplayinwindowclick.b() >= this.player.activeContainer.c.size()) {
++                    return;
++                }
++                // VoidSoulSpigot end
++
+                 InventoryView inventory = this.player.activeContainer.getBukkitView();
+                 SlotType type = CraftInventoryView.getSlotType(inventory, packetplayinwindowclick.b());
+ 

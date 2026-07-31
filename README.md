@@ -48,6 +48,19 @@ competitivos como Azurite.
       (default `0` = comportamiento Spigot). Los ítems se fusionan un poco más tarde pero el
       número de escaneos baja muchísimo.
 
+- **Protección contra paquetes maliciosos**:
+    - Validación de slot en `PacketPlayInWindowClick`: el slot es un `short` que venía del
+      cliente sin cota superior, y varios modos de click indexaban la lista de slots con él
+      sin comprobar. Un paquete manipulado hacía saltar `IndexOutOfBoundsException` en el hilo
+      principal, y cada excepción se registraba con stack trace completo → spam de log y disco.
+    - Validación del índice de botón en `PacketPlayInEnchantItem`, que indexaba un array de 3
+      posiciones directamente con el valor del cliente.
+    - Contención genérica de errores de paquete: las excepciones de cualquier handler dejan de
+      escaparse a `SystemUtils` (que loggeaba en FATAL una por paquete). Ahora se agrupan en una
+      entrada cada 10 s con el número de repeticiones suprimidas, y `security.kickOnPacketError`
+      (desactivado por defecto) expulsa a quien las provoca. Esto también cubre bugs de handler
+      que todavía no se han encontrado.
+
 Todo lo de PandaSpigot sigue disponible: Netty 4.1, tick loop moderno, knockback base, eventos backporteados
 (`PlayerChunkLoadEvent`, `EntityMoveEvent`, etc.), Adventure API y más. Ver [patches](./patches/).
 
@@ -98,6 +111,22 @@ Fuera de `voidsoul.yml`, para este tipo de servidor conviene revisar también:
 - `spigot.yml` → `max-entity-collisions`, `entity-activation-range`, `hopper-transfer` /
   `hopper-check`.
 - `paper.yml` → `keep-spawn-loaded`, `use-async-lighting`.
+
+## Seguridad
+
+Ya venían cubiertos por PandaSpigot/Paper y no hizo falta tocarlos: Log4Shell (log4j 2.25.3),
+límites de tamaño de libros y carteles, cooldown de edición/firma de libros, límite de NBT en
+paquetes (50 KB), rechazo de movimiento con NaN/Infinity, límite de 128 canales de plugin,
+`filterCreativeItems`, y el limitador de paquetes de `pandaspigot.yml`.
+
+Lo que **no** puede arreglar el fork y depende de tu configuración:
+
+- Si usas `bungeecord: true` en `spigot.yml`, el servidor confía en la IP y el UUID que le manda
+  el proxy. **Tiene que estar cortafuegos de por medio**: si el puerto es accesible desde fuera,
+  cualquiera puede conectarse suplantando a cualquier jugador, incluidos los admins.
+- `online-mode=false` sin proxy tiene el mismo problema.
+- Los exploits de plugins (dupes de economía, GUIs de venta, `/pay` con cantidades negativas) van
+  por su cuenta; el fork no puede verlos.
 
 Comandos útiles del script de build (`./panda`):
 

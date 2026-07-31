@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:49:35 -0500
+Subject: [PATCH] Contain packet handler errors
+
+Exceptions thrown while handling a packet on the main thread escape into
+SystemUtils, which logs a full stack trace at FATAL for every occurrence.
+Crafted packets that make a handler throw never bring the server down on
+their own; the unbounded log spam is the actual attack, and it works for
+any handler bug that hasn't been found yet.
+
+Repeats of the same error are now collapsed into one entry every 10
+seconds with a suppressed count, and security.kickOnPacketError (off by
+default) disconnects whoever sent the packet.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 85cad5bdfc2336bbc388702c62b1d3c473269c27..d32e427b59a86bc85b9433beab21edb36fca06e9 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -100,9 +100,35 @@ public class VoidSoulConfig {
+         return config != null && config.serverBrandName != null ? config.serverBrandName : "VoidSoulSpigot";
+     }
+ 
++    /**
++     * @return Whether players should be disconnected when one of their packets makes a
++     *         handler throw. Safe to call before the config is loaded.
++     */
++    public static boolean isKickOnPacketError() {
++        return config != null && config.security != null && config.security.kickOnPacketError;
++    }
++
+     //------------------------------------------------------------------------
+ 
+     @Comment("The server brand name shown in the client's F3 screen, in the /version command,\n" +
+             "and used as the server name by plugins.")
+     public String serverBrandName = "VoidSoulSpigot";
++
++    @Comment("Protection against malicious clients.")
++    public SecurityConfig security = new SecurityConfig();
++
++    @ConfigSerializable
++    public static class SecurityConfig {
++        @Comment("Disconnect a player when one of their packets makes a handler throw.\n" +
++                "\n" +
++                "Crafted packets that make the server throw don't stop the server on their\n" +
++                "own, but each one is logged with a full stack trace, so spamming them is a\n" +
++                "cheap way to flood the log and the disk. VoidSoulSpigot always collapses\n" +
++                "repeats of the same error into one entry every 10 seconds; enabling this\n" +
++                "also kicks whoever sent the packet.\n" +
++                "\n" +
++                "Leave it off if a buggy plugin throws during normal play, since that would\n" +
++                "then kick legitimate players too. Check the log before turning it on.")
++        public boolean kickOnPacketError = false;
++    }
+ }
+diff --git a/src/main/java/net/minecraft/server/PlayerConnectionUtils.java b/src/main/java/net/minecraft/server/PlayerConnectionUtils.java
+index 2956c34ea5e158a26a9d15b1e9d88aa61c94e805..b3ef8e990d173fb78ae185fd16b94a1fb253b837 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnectionUtils.java
++++ b/src/main/java/net/minecraft/server/PlayerConnectionUtils.java
+@@ -1,15 +1,84 @@
+ package net.minecraft.server;
+ 
++// VoidSoulSpigot start - contain packet handler errors
++import com.voidsoul.spigot.config.VoidSoulConfig;
++import java.util.HashMap;
++import java.util.Map;
++import org.apache.logging.log4j.LogManager;
++import org.apache.logging.log4j.Logger;
++// VoidSoulSpigot end
++
+ public class PlayerConnectionUtils {
+ 
+     public static <T extends PacketListener> void ensureMainThread(final Packet<T> packet, final T t0, IAsyncTaskHandler iasynctaskhandler) throws CancelledPacketHandleException {
+         if (!iasynctaskhandler.isMainThread()) {
+             iasynctaskhandler.postToMainThread(new Runnable() {
+                 public void run() {
+-                    packet.a(t0);
++                    // VoidSoulSpigot start - contain packet handler errors
++                    try {
++                        packet.a(t0);
++                    } catch (Throwable throwable) {
++                        handlePacketError(packet, t0, throwable);
++                    }
++                    // VoidSoulSpigot end
+                 }
+             });
+             throw CancelledPacketHandleException.INSTANCE;
+         }
+     }
++
++    // VoidSoulSpigot start - contain packet handler errors
++    private static final Logger LOGGER = LogManager.getLogger();
++    private static final long ERROR_LOG_INTERVAL_MS = 10000L;
++
++    /** Only touched from the main thread, which is where the packet tasks above run. */
++    private static final Map<String, ErrorCounter> ERROR_COUNTERS = new HashMap<String, ErrorCounter>();
++
++    private static final class ErrorCounter {
++        private long lastLog;
++        private int suppressed;
++    }
++
++    /**
++     * Handles an exception thrown while a packet was being processed on the main thread.
++     * <p>
++     * Without this the exception escapes into {@link SystemUtils}, which logs a full stack
++     * trace at FATAL for every single packet. Malformed-packet "crashers" rely on exactly
++     * that: the handler itself never brings the server down, the log spam does. Repeated
++     * errors of the same kind are collapsed into one entry every 10 seconds, and the sender
++     * can be disconnected instead if {@code security.kickOnPacketError} is enabled.
++     */
++    private static void handlePacketError(Packet<?> packet, PacketListener listener, Throwable throwable) {
++        String packetName = packet.getClass().getSimpleName();
++        String playerName = null;
++
++        if (listener instanceof PlayerConnection) {
++            PlayerConnection connection = (PlayerConnection) listener;
++            playerName = connection.player != null ? connection.player.getName() : null;
++
++            if (VoidSoulConfig.isKickOnPacketError()) {
++                connection.disconnect("Invalid packet");
++            }
++        }
++
++        long now = System.currentTimeMillis();
++        ErrorCounter counter = ERROR_COUNTERS.get(packetName);
++
++        if (counter == null) {
++            counter = new ErrorCounter();
++            ERROR_COUNTERS.put(packetName, counter);
++        } else if (now - counter.lastLog < ERROR_LOG_INTERVAL_MS) {
++            counter.suppressed++;
++            return;
++        }
++
++        int suppressed = counter.suppressed;
++        counter.suppressed = 0;
++        counter.lastLog = now;
++
++        LOGGER.error("Error handling packet " + packetName
++                + (playerName != null ? " from " + playerName : "")
++                + (suppressed > 0 ? " (" + suppressed + " similar errors suppressed)" : ""), throwable);
++    }
++    // VoidSoulSpigot end
+ }
