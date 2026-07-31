@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:29:08 -0500
+Subject: [PATCH] Dropped item limits and merge throttling
+
+Mining-heavy servers can pile up thousands of dropped items, and each one
+scans its surroundings for merge candidates whenever it moves.
+
+entities.maxItemsPerChunk caps how many items a chunk may hold, dropping
+the oldest one when a new item goes over the limit, and
+entities.itemMergeCheckIntervalTicks puts a minimum tick spacing between
+merge scans.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 7153d034ea225777773cb7d38942652e6e9f72b0..e37ca579dd5825daa0ca2575b59e16ddd9ac0555 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -112,6 +112,20 @@ public class VoidSoulWorldConfig {
+                 "Note: this is server-side only, so a client still shows a little local\n" +
+                 "pushing before the server corrects the position.")
+         public boolean playerCollisions = true;
++
++        @Comment("Maximum number of dropped items allowed in a single chunk. When a new\n" +
++                "item would go over the limit, the oldest item in that chunk is removed.\n" +
++                "This is a hard safety net against item floods from mining, mob farms or\n" +
++                "a player dumping their inventory. 0 disables the limit.\n" +
++                "Recommended for prison-style servers: 200-400.")
++        public int maxItemsPerChunk = 0;
++
++        @Comment("Minimum number of ticks between item merge scans. Every dropped item\n" +
++                "normally scans its surroundings for other items whenever it moves, which\n" +
++                "gets expensive with thousands of items on the ground. Raising this makes\n" +
++                "items merge slightly later but cuts the scan count dramatically.\n" +
++                "0 keeps the vanilla/Spigot behaviour. Recommended: 5-20.")
++        public int itemMergeCheckIntervalTicks = 0;
+     }
+ 
+     @Comment("Toggles for per-tick systems. Disabling a system stops its processing\n" +
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index 92c4c9c361ee1ccf90936a7b8b77cbda393d3a0d..3a45b70f06dce8d3a47c6d87b6e96357bea415d7 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -756,6 +756,7 @@ public class Chunk {
+         // PaperSpigot start - update counts
+         if (entity instanceof EntityItem) {
+             itemCounts[k]++;
++            this.enforceItemLimit(); // VoidSoulSpigot - limit dropped items per chunk
+         } else if (entity instanceof IInventory) {
+             inventoryEntityCounts[k]++;
+         }
+@@ -778,6 +779,43 @@ public class Chunk {
+         // Spigot end
+     }
+ 
++    // VoidSoulSpigot start - limit dropped items per chunk
++    /**
++     * Removes the oldest dropped item in this chunk while the chunk holds more items
++     * than {@code entities.maxItemsPerChunk} allows. Only ever runs while over the
++     * limit, so the scan cost is paid by the item flood that caused it.
++     */
++    private void enforceItemLimit() {
++        final int limit = this.world.voidsoulConfig.entities.maxItemsPerChunk;
++        if (limit <= 0) return;
++
++        int total = 0;
++        for (int slice = 0; slice < this.itemCounts.length; ++slice) {
++            total += this.itemCounts[slice];
++        }
++        if (total <= limit) return;
++
++        EntityItem oldest = null;
++        for (int slice = 0; slice < this.entitySlices.length; ++slice) {
++            if (this.itemCounts[slice] <= 0) continue;
++
++            for (Entity other : this.entitySlices[slice]) {
++                if (!(other instanceof EntityItem)) continue;
++                EntityItem item = (EntityItem) other;
++                if (item.dead) continue;
++
++                if (oldest == null || item.getAge() > oldest.getAge()) {
++                    oldest = item;
++                }
++            }
++        }
++
++        if (oldest != null) {
++            oldest.die();
++        }
++    }
++    // VoidSoulSpigot end
++
+     public void b(Entity entity) {
+         this.a(entity, entity.af);
+     }
+diff --git a/src/main/java/net/minecraft/server/EntityItem.java b/src/main/java/net/minecraft/server/EntityItem.java
+index 47272471c8477cb34720b116c212cd3f61f4735f..4a7bf4f24dea90e1dab22bf68f25c0ea3257af5a 100644
+--- a/src/main/java/net/minecraft/server/EntityItem.java
++++ b/src/main/java/net/minecraft/server/EntityItem.java
+@@ -9,7 +9,18 @@ public class EntityItem extends Entity {
+ 
+     private static final Logger b = LogManager.getLogger();
+     private int age;
++    private int lastMergeTick; // VoidSoulSpigot - throttle item merge scans
+     public int pickupDelay;
++
++    // VoidSoulSpigot start - limit dropped items per chunk
++    /**
++     * @return how many ticks this item has existed for, used to pick the oldest item
++     *         in a chunk when the per-chunk item limit is exceeded.
++     */
++    public int getAge() {
++        return this.age;
++    }
++    // VoidSoulSpigot end
+     private int e;
+     private String f;
+     private String g;
+@@ -82,9 +93,16 @@ public class EntityItem extends Entity {
+                     this.makeSound("random.fizz", 0.4F, 2.0F + this.random.nextFloat() * 0.4F);
+                 }
+ 
++                // VoidSoulSpigot start - throttle item merge scans
+                 if (!this.world.isClientSide) {
+-                    this.w();
++                    int mergeInterval = this.world.voidsoulConfig.entities.itemMergeCheckIntervalTicks;
++
++                    if (mergeInterval <= 0 || MinecraftServer.currentTick - this.lastMergeTick >= mergeInterval) {
++                        this.lastMergeTick = MinecraftServer.currentTick;
++                        this.w();
++                    }
+                 }
++                // VoidSoulSpigot end
+             }
+ 
+             float f = 0.98F;

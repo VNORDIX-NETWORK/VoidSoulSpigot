@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:28:23 -0500
+Subject: [PATCH] Configurable chunk unload delay
+
+Servers where players constantly move between separate areas (private
+mines, plots, arenas) unload chunks the moment the last player leaves and
+load them straight back from disk seconds later. chunks.unloadDelayTicks
+makes a chunk sit in the unload queue for a while first; if it comes back
+into view during that time it is simply taken out of the queue, with no
+disk I/O at all.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index b2891335977fa58ac0232eb1a985eda24af04a50..fc09b51b87ae0ca3caf75b88b71866e1080fe171 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -86,6 +86,16 @@ public class VoidSoulWorldConfig {
+                 "one pass are saved on the following passes, and unloads/shutdown always\n" +
+                 "save everything. Set to 0 for the unlimited Spigot behaviour.")
+         public int maxAutosaveChunksPerPass = 200;
++
++        @Comment("How many ticks a chunk must sit in the unload queue before it is\n" +
++                "actually unloaded. Servers where players constantly teleport between\n" +
++                "areas (private mines, plots, arenas) otherwise unload chunks and load\n" +
++                "them straight back from disk. A chunk that comes back into view during\n" +
++                "the delay is simply taken out of the queue, with no disk I/O at all.\n" +
++                "0 keeps the vanilla behaviour of unloading as soon as possible.\n" +
++                "Reasonable values are 200-600 (10-30 seconds); higher values keep more\n" +
++                "chunks in memory.")
++        public int unloadDelayTicks = 0;
+     }
+ 
+     @Comment("Toggles for per-tick systems. Disabling a system stops its processing\n" +
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index bdbda3e61c86dc298862fe560942a08fdc57e3a5..92c4c9c361ee1ccf90936a7b8b77cbda393d3a0d 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -39,6 +39,7 @@ public class Chunk {
+     public final List<Entity>[] entitySlices; // Spigot
+     // PaperSpigot start - track the number of minecarts and items
+     // Keep this synced with entitySlices.add() and entitySlices.remove()
++    public int unloadQueuedTick; // VoidSoulSpigot - tick this chunk entered the unload queue
+     private final int[] itemCounts = new int[16];
+     private final int[] inventoryEntityCounts = new int[16];
+     // PaperSpigot end
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 6165395926740636b34f9223d6d5418cf07292e2..8b6825fccaba395ddd4f43976f415d87d9f4635a 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -77,21 +77,23 @@ public class ChunkProviderServer implements IChunkProvider {
+         if (this.world.worldProvider.e()) {
+             if (!this.world.c(i, j)) {
+                 // CraftBukkit start
+-                this.unloadQueue.add(i, j);
++                boolean queued = this.unloadQueue.add(i, j); // VoidSoulSpigot
+ 
+                 Chunk c = chunks.get(key); // PandaSpigot - Reuse key
+                 if (c != null) {
+                     c.mustSave = true;
++                    if (queued) c.unloadQueuedTick = MinecraftServer.currentTick; // VoidSoulSpigot - chunk unload delay
+                 }
+                 // CraftBukkit end
+             }
+         } else {
+             // CraftBukkit start
+-            this.unloadQueue.add(i, j);
++            boolean queued = this.unloadQueue.add(i, j); // VoidSoulSpigot
+ 
+             Chunk c = chunks.get(key); // PandaSpigot - Reuse key
+             if (c != null) {
+                 c.mustSave = true;
++                if (queued) c.unloadQueuedTick = MinecraftServer.currentTick; // VoidSoulSpigot - chunk unload delay
+             }
+             // CraftBukkit end
+         }
+@@ -382,14 +384,31 @@ public class ChunkProviderServer implements IChunkProvider {
+         if (!this.world.savingDisabled) {
+             // CraftBukkit start
+             Server server = this.world.getServer();
+-            // VoidSoulSpigot start - configurable chunk unload rate
++            // VoidSoulSpigot start - configurable chunk unload rate and delay
+             int maxUnloads = this.world.voidsoulConfig.chunks.maxUnloadsPerTick;
+             if (maxUnloads <= 0) maxUnloads = Integer.MAX_VALUE;
+-            for (int i = 0; i < maxUnloads && !this.unloadQueue.isEmpty(); ++i) { // VoidSoulSpigot end
++
++            final int unloadDelay = this.world.voidsoulConfig.chunks.unloadDelayTicks;
++            // Chunks whose delay hasn't elapsed yet. They are put back once the loop is
++            // done, so they can't be popped again during this same pass.
++            final java.util.List<Long> deferred = unloadDelay > 0 ? new java.util.ArrayList<Long>() : null;
++            // Bound how many queue entries we look at, so a queue full of delayed chunks
++            // can't make us spin over the whole thing every tick.
++            final int maxExamined = maxUnloads > Integer.MAX_VALUE / 4 ? Integer.MAX_VALUE : maxUnloads * 4;
++
++            for (int i = 0, examined = 0; i < maxUnloads && examined < maxExamined && !this.unloadQueue.isEmpty(); ++examined) {
+                 long chunkcoordinates = this.unloadQueue.popFirst();
+                 Chunk chunk = this.chunks.get(chunkcoordinates);
+                 if (chunk == null) continue;
+ 
++                if (unloadDelay > 0 && MinecraftServer.currentTick - chunk.unloadQueuedTick < unloadDelay) {
++                    deferred.add(chunkcoordinates);
++                    continue;
++                }
++
++                ++i;
++                // VoidSoulSpigot end
++
+                 ChunkUnloadEvent event = new ChunkUnloadEvent(chunk.bukkitChunk);
+                 server.getPluginManager().callEvent(event);
+                 if (!event.isCancelled()) {
+@@ -421,6 +440,14 @@ public class ChunkProviderServer implements IChunkProvider {
+                     }
+                 }
+             }
++
++            // VoidSoulSpigot start - put chunks that are still within their unload delay back in the queue
++            if (deferred != null) {
++                for (int i = 0; i < deferred.size(); ++i) {
++                    this.unloadQueue.add(deferred.get(i));
++                }
++            }
++            // VoidSoulSpigot end
+             // CraftBukkit end
+ 
+             if (this.chunkLoader != null) {

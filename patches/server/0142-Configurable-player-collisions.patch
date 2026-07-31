@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:28:39 -0500
+Subject: [PATCH] Configurable player collisions
+
+Every player scans for nearby entities each tick to work out what to push,
+which becomes one of the biggest costs when a crowd stacks up in a mine
+entrance or at spawn. entities.playerCollisions lets that scan be skipped
+entirely for players, which also removes player-vs-player pushing.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index fc09b51b87ae0ca3caf75b88b71866e1080fe171..7153d034ea225777773cb7d38942652e6e9f72b0 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -98,6 +98,22 @@ public class VoidSoulWorldConfig {
+         public int unloadDelayTicks = 0;
+     }
+ 
++    @Comment("Entity behaviour and performance settings.")
++    public EntitiesConfig entities;
++
++    @ConfigSerializable
++    public static class EntitiesConfig {
++        @Comment("Whether players push other entities. Disabling this skips the nearby\n" +
++                "entity scan every player runs every tick, which is one of the heaviest\n" +
++                "costs when a lot of players stack up in a small area (mine entrances,\n" +
++                "KOTH, spawn). Players can still hit each other and still get pushed by\n" +
++                "mobs; they just stop pushing anything themselves, so player-vs-player\n" +
++                "pushing goes away completely.\n" +
++                "Note: this is server-side only, so a client still shows a little local\n" +
++                "pushing before the server corrects the position.")
++        public boolean playerCollisions = true;
++    }
++
+     @Comment("Toggles for per-tick systems. Disabling a system stops its processing\n" +
+             "entirely in this world, which can significantly help TPS on PvP or\n" +
+             "minigame servers that don't need it.")
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 27f17d28cd21bfb312a0ac53b2f3fb51eec54a20..e621ce664817f64b480ee9a5da0065e5da674d49 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -1703,6 +1703,11 @@ public abstract class EntityLiving extends Entity {
+     protected void doTick() {}
+ 
+     protected void bL() {
++        // VoidSoulSpigot start - configurable player collisions
++        if (this instanceof EntityHuman && !this.world.voidsoulConfig.entities.playerCollisions) {
++            return;
++        }
++        // VoidSoulSpigot end
+         List list = this.world.a((Entity) this, this.getBoundingBox().grow(0.20000000298023224D, 0.0D, 0.20000000298023224D), Predicates.and(IEntitySelector.d, new Predicate() {
+             public boolean a(Entity entity) {
+                 return entity.ae();

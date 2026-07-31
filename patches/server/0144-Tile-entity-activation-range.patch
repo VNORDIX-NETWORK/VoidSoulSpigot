@@ -1,0 +1,94 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 16:29:22 -0500
+Subject: [PATCH] Tile entity activation range
+
+Servers with hundreds of player-owned cells or plots spend a large part of
+every tick updating furnaces, hoppers and other machines that nobody is
+near. ticking.tileEntityActivationRange restricts tile entity ticking to
+chunks close to a player, rebuilding the active chunk set once per tick so
+the check itself is a single hash lookup per tile entity.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index e37ca579dd5825daa0ca2575b59e16ddd9ac0555..c23d4b4fb22c91d0f75128cb4919d6ac7b572114 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -140,5 +140,16 @@ public class VoidSoulWorldConfig {
+         public boolean tickBrewingStands = true;
+         public boolean tickBeacons = true;
+         public boolean tickVillages = true;
++
++        @Comment("Only tick tile entities (furnaces, hoppers, brewing stands, beacons,\n" +
++                "spawners, note blocks, ...) within this many blocks of a player.\n" +
++                "Servers with hundreds of player-owned cells or plots spend a large part\n" +
++                "of every tick updating machines nobody is looking at; this stops that\n" +
++                "work without disabling the machines outright. Tile entities resume\n" +
++                "exactly where they left off when a player comes back.\n" +
++                "0 disables the check and ticks everything (vanilla behaviour).\n" +
++                "Recommended: 64-128. Note that furnaces and hoppers far from any player\n" +
++                "will not progress while nobody is nearby.")
++        public int tileEntityActivationRange = 0;
+     }
+ }
+diff --git a/src/main/java/net/minecraft/server/World.java b/src/main/java/net/minecraft/server/World.java
+index fcb7ceecf753bbfdb2d1b1c15330159c38cf253a..9fbabc61581d321ce77980e121a95d1ae3b358ab 100644
+--- a/src/main/java/net/minecraft/server/World.java
++++ b/src/main/java/net/minecraft/server/World.java
+@@ -171,6 +171,35 @@ public abstract class World implements IBlockAccess {
+ 
+     public com.voidsoul.spigot.config.VoidSoulWorldConfig voidsoulConfig; // VoidSoulSpigot
+ 
++    // VoidSoulSpigot start - tile entity activation range
++    private final org.bukkit.craftbukkit.util.LongHashSet activeTileEntityChunks = new org.bukkit.craftbukkit.util.LongHashSet();
++
++    /**
++     * Rebuilds the set of chunks that contain, or are close enough to, a player for
++     * tile entities inside them to be ticked this tick.
++     *
++     * @param range activation range in blocks
++     */
++    private void updateActiveTileEntityChunks(int range) {
++        this.activeTileEntityChunks.clear();
++
++        final int chunkRange = (range >> 4) + 1;
++        for (int i = 0; i < this.players.size(); ++i) {
++            EntityHuman player = this.players.get(i);
++            if (player.isSpectator()) continue;
++
++            final int chunkX = MathHelper.floor(player.locX) >> 4;
++            final int chunkZ = MathHelper.floor(player.locZ) >> 4;
++
++            for (int x = chunkX - chunkRange; x <= chunkX + chunkRange; ++x) {
++                for (int z = chunkZ - chunkRange; z <= chunkZ + chunkRange; ++z) {
++                    this.activeTileEntityChunks.add(x, z);
++                }
++            }
++        }
++    }
++    // VoidSoulSpigot end
++
+     public final co.aikar.timings.WorldTimingsHandler timings; // Spigot
+ 
+     public CraftWorld getWorld() {
+@@ -1631,6 +1660,9 @@ public abstract class World implements IBlockAccess {
+         }
+         // CraftBukkit end
+ 
++        final int tileActivationRange = this.voidsoulConfig.ticking.tileEntityActivationRange; // VoidSoulSpigot - tile entity activation range
++        if (tileActivationRange > 0) this.updateActiveTileEntityChunks(tileActivationRange); // VoidSoulSpigot
++
+         // Spigot start
+         // int tilesThisCycle = 0; // PandaSpigot - Remove unused code
+         for (tileTickPosition = 0; tileTickPosition < tileEntityList.size(); tileTickPosition++) { // PaperSpigot - Disable tick limiters
+@@ -1648,7 +1680,10 @@ public abstract class World implements IBlockAccess {
+             if (!tileentity.x() && tileentity.t()) {
+                 BlockPosition blockposition = tileentity.getPosition();
+ 
+-                if (this.isLoaded(blockposition) && this.N.a(blockposition)) {
++                // VoidSoulSpigot start - tile entity activation range
++                if (this.isLoaded(blockposition) && this.N.a(blockposition)
++                        && (tileActivationRange <= 0 || this.activeTileEntityChunks.contains(blockposition.getX() >> 4, blockposition.getZ() >> 4))) {
++                // VoidSoulSpigot end
+                     try {
+                         tileentity.tickTimer.startTiming(); // Spigot
+                         ((IUpdatePlayerListBox) tileentity).c();
