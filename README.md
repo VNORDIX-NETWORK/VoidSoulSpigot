@@ -31,6 +31,13 @@ competitivos como Azurite.
       de verdad (default `0` = vanilla). Si el jugador vuelve antes de que expire, el chunk
       sale de la cola sin ninguna E/S de disco. Pensado para servidores donde la gente salta
       constantemente entre zonas (minas privadas, plots, arenas).
+    - `chunks.maxLightGapChecksPerTick`: máximo de columnas de luz de cielo recalculadas por
+      chunk y por tick (default `0` = vanilla). Cuando un bloque cambia a la altura del bloque
+      más alto de su columna o por encima, esa columna se marca para recalcular la luz de cielo,
+      y el chunk se las come **todas de golpe en un solo tick**. Un reset de mina a cielo abierto
+      marca las 256 columnas de cada chunk que toca — eso es lo que convierte el reset en un pico
+      de TPS. Bajarlo reparte ese trabajo entre los ticks siguientes. Sólo aplica a minas
+      abiertas al cielo.
     - Toggles de tick por mundo: `ticking.tickHoppers`, `tickFurnaces`, `tickBrewingStands`,
       `tickBeacons`, `tickVillages`.
     - `ticking.tileEntityActivationRange`: sólo tickea tile entities (hornos, hoppers, alambiques,
@@ -86,6 +93,7 @@ worlds:
       maxUnloadsPerTick: 50
       maxAutosaveChunksPerPass: 200
       unloadDelayTicks: 400        # ~20 s; evita descargar y recargar minas al saltar entre ellas
+      maxLightGapChecksPerTick: 32 # reparte el recálculo de luz tras un reset de mina
     ticking:
       tileEntityActivationRange: 96
     entities:
@@ -103,14 +111,44 @@ Ten en cuenta los efectos de juego antes de aplicarlo:
 - `maxItemsPerChunk` **borra** ítems cuando se pasa del límite. 300 es holgado para minar, pero
   si tienes zonas donde se acumulan drops a propósito, súbelo.
 
-Fuera de `voidsoul.yml`, para este tipo de servidor conviene revisar también:
+### Ajustes fuera de `voidsoul.yml`
 
-- `spigot.yml` → `anti-xray.enabled`: está activo por defecto y cuesta CPU en cada envío de chunk
-  y en cada cambio de bloque, justo lo que más hace una mina al resetearse.
-- `spigot.yml` → `merge-radius.item` y `item-despawn-rate`: complementan a `maxItemsPerChunk`.
-- `spigot.yml` → `max-entity-collisions`, `entity-activation-range`, `hopper-transfer` /
-  `hopper-check`.
-- `paper.yml` → `keep-spawn-loaded`, `use-async-lighting`.
+A estas alturas la mayor parte del margen que queda en el servidor está en estas opciones, no en
+más parches. Ordenadas por impacto para un prison:
+
+| Archivo | Opción | Por qué |
+| --- | --- | --- |
+| `spigot.yml` | `anti-xray.enabled: false` | Activo por defecto. Cuesta CPU en cada envío de chunk y en cada cambio de bloque — justo lo que más hace una mina al resetearse. Si lo necesitas, `engine-mode: 1` es más barato que el 2. |
+| `bukkit.yml` | `spawn-limits.*: 0` | Si no hay mobs en el prison, el intento de spawn por chunk desaparece entero. |
+| `server.properties` | `view-distance` | Bajarlo de 10 a 5-6 reduce a la cuarta parte los chunks que se envían y se tickean por jugador. Es probablemente el ajuste con mejor relación impacto/esfuerzo. |
+| por mundo | `/gamerule randomTickSpeed 0` | En las minas nada necesita random ticks. Quita el sorteo de 3 bloques por sección y por chunk cercano a jugadores. |
+| `spigot.yml` | `merge-radius.item`, `item-despawn-rate` | Complementan a `maxItemsPerChunk`. |
+| `spigot.yml` | `max-entity-collisions`, `entity-activation-range`, `hopper-transfer`, `hopper-check` | |
+| `paper.yml` | `disable-thunder`, `disable-ice-and-snow`, `disable-mood-sounds` | Corren por cada chunk cercano a un jugador y en un prison no aportan nada. |
+| `paper.yml` | `tick-next-tick-list-cap` | Limita la avalancha de updates programados si tus minas tienen arena, grava o líquidos. |
+| `paper.yml` | `keep-spawn-loaded` | |
+
+### Lo que ya está optimizado (no busques ahí)
+
+Al auditarlo comprobé que estas rutas ya están cubiertas por PandaSpigot/Paper, por si te ahorra
+tiempo: el ticking de chunks ya se limita a los chunks cercanos a jugadores (así que los random
+ticks, el clima y el hielo **no** corren en las minas vacías), la carga de chunks ya es asíncrona
+(`ChunkIOExecutor`), las explosiones ya cachean densidad (útil para picos explosivos), la lista de
+tile entities ya contiene sólo las que tickean, y ya existe caché de `ChunkMap` para el envío de
+chunks.
+
+### El reset de minas: lo que el fork no puede arreglar solo
+
+Si tras todo esto los resets siguen dando picos, el cuello de botella está en **cómo escribe los
+bloques tu plugin de minas**, y eso no lo puede optimizar el servidor. La diferencia es grande:
+
+- `block.setType(...)` bloque a bloque paga por cada bloque la actualización de heightmap, el
+  marcado de luz y la comprobación de tile entity.
+- Escribir directo en las `ChunkSection`, llamar a `initLighting()` una vez por chunk al final y
+  reenviar los chunks afectados es órdenes de magnitud más rápido.
+
+Si tu plugin permite elegir, activa el modo "rápido"/NMS y **escalona** los resets (que no
+caigan todas las minas en el mismo tick).
 
 ## Seguridad
 

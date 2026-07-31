@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 18:01:26 -0500
+Subject: [PATCH] Budget sky light gap rechecks
+
+A block change at or above the highest block in its column flags that
+column for a sky light re-check, and the chunk then works through every
+flagged column in one tick. A mine reset in an open-topped mine flags all
+256 columns of every chunk it touches, so the whole cost lands in a single
+tick and shows up as a spike.
+
+chunks.maxLightGapChecksPerTick caps how many columns a chunk re-checks
+per tick, leaving the rest flagged for the following ticks. Defaults to
+the previous behaviour.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index c23d4b4fb22c91d0f75128cb4919d6ac7b572114..c2718fad5eed5ec4d38a6e71efd4d408c0698f8c 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -96,6 +96,20 @@ public class VoidSoulWorldConfig {
+                 "Reasonable values are 200-600 (10-30 seconds); higher values keep more\n" +
+                 "chunks in memory.")
+         public int unloadDelayTicks = 0;
++
++        @Comment("Maximum number of sky light columns re-checked per chunk per tick.\n" +
++                "\n" +
++                "When a block changes at or above the highest block in its column, that\n" +
++                "column is flagged for a sky light re-check, and the chunk works through\n" +
++                "every flagged column in a single tick. A mine reset in an open-topped\n" +
++                "mine flags all 256 columns of every chunk it touches at once, and paying\n" +
++                "for all of them in one tick is what turns the reset into a TPS spike.\n" +
++                "\n" +
++                "Lowering this spreads that work over the following ticks instead. Light\n" +
++                "may look stale for a moment after a large reset, and it catches up on\n" +
++                "its own. 0 keeps the vanilla behaviour of doing all of them at once.\n" +
++                "Recommended: 16-64. Only helps mines that are open to the sky.")
++        public int maxLightGapChecksPerTick = 0;
+     }
+ 
+     @Comment("Entity behaviour and performance settings.")
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index 3a45b70f06dce8d3a47c6d87b6e96357bea415d7..042dde869e10b890474f376e15c32159444005bd 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -283,9 +283,22 @@ public class Chunk {
+     private void h(boolean flag) {
+         this.world.methodProfiler.a("recheckGaps");
+         if (this.world.areChunksLoaded(new BlockPosition(this.locX * 16 + 8, 0, this.locZ * 16 + 8), 16)) {
++            // VoidSoulSpigot start - spread sky light gap rechecks over several ticks
++            int budget = this.world.voidsoulConfig.chunks.maxLightGapChecksPerTick;
++            if (budget <= 0) budget = Integer.MAX_VALUE;
++            int checked = 0;
++            // VoidSoulSpigot end
++
+             for (int i = 0; i < 16; ++i) {
+                 for (int j = 0; j < 16; ++j) {
+                     if (this.g[i + j * 16]) {
++                        // VoidSoulSpigot start - out of budget, leave the rest flagged for the next tick
++                        if (checked >= budget) {
++                            this.world.methodProfiler.b();
++                            return;
++                        }
++                        ++checked;
++                        // VoidSoulSpigot end
+                         this.g[i + j * 16] = false;
+                         int k = this.b(i, j);
+                         int l = this.locX * 16 + i;
