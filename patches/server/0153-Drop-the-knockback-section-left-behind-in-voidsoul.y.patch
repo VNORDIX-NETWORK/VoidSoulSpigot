@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 21:40:31 -0500
+Subject: [PATCH] Drop the knockback section left behind in voidsoul.yml
+
+Configurate keeps nodes it no longer recognises, so after knockback moved
+to its own file a server would show two knockback sections with only one
+of them doing anything.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index d32e427b59a86bc85b9433beab21edb36fca06e9..622b81510baa3ff10377e0b8c5bfcc1fb558654b 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -59,6 +59,7 @@ public class VoidSoulConfig {
+             defaultWorldNode.set(defaultWorldConfig); // populate default in config
+ 
+             root.set(config); // update backing node
++            dropMovedKnockbackSection(worldsNode); // VoidSoulSpigot - knockback lives in knockback.yml now
+             loader.save(root);
+ 
+             // call after save
+@@ -68,6 +69,29 @@ public class VoidSoulConfig {
+         }
+     }
+ 
++    /**
++     * Removes the "knockback" section left behind in voidsoul.yml by earlier builds.
++     * <p>
++     * Knockback now lives in its own file, and configurate keeps nodes it no longer
++     * recognises, so without this a server would show two knockback sections with only one
++     * of them doing anything.
++     */
++    private static void dropMovedKnockbackSection(ConfigurationNode worldsNode) throws Exception {
++        boolean removed = false;
++
++        for (ConfigurationNode worldNode : worldsNode.childrenMap().values()) {
++            if (!worldNode.node("knockback").virtual()) {
++                worldNode.removeChild("knockback");
++                removed = true;
++            }
++        }
++
++        if (removed) {
++            org.bukkit.Bukkit.getLogger().info("Knockback settings have moved to VoidSoul/knockback.yml; "
++                    + "the old section in voidsoul.yml was removed. Use /knockback to edit them in game.");
++        }
++    }
++
+     private static void initWorlds(ConfigurationNode node) throws Exception {
+         worldConfigs.clear();
+         for (Map.Entry<Object, ? extends ConfigurationNode> entry : node.childrenMap().entrySet()) {

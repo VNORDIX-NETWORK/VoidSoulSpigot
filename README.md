@@ -12,8 +12,17 @@ competitivos como Azurite.
   Spigot/Paper y hay plugins y paneles que los buscan ahí.
 - **`voidsoul.yml`**: archivo de configuración propio, con secciones por mundo (igual que `pandaspigot.yml`).
 - **Marca configurable** (`serverBrandName`): el nombre que aparece en el F3 del cliente y en `/version`.
-- **Sistema de knockback extendido** (por mundo, sección `knockback`). `knockback.type` elige entre
-  tres modelos, y todos los defaults reproducen el comportamiento anterior:
+- **`VoidSoul/knockback.yml`**: el knockback tiene su propio archivo, con secciones por mundo
+  (`worlds.default`, más una por mundo si quieres que la arena vaya distinta a las minas). Si vienes
+  de una versión anterior, la sección `knockback` de `voidsoul.yml` se elimina sola al arrancar.
+- **Comando `/knockback`** (alias `/kb`, permiso `voidsoul.command.knockback`): abre un **editor in-game**
+  del knockback del mundo donde estás. Click izquierdo sube el valor, derecho lo baja, shift da pasos
+  grandes; los booleanos alternan y el modelo cicla. Cada cambio se escribe en `knockback.yml` y se
+  aplica al instante. `/knockback <mundo>` edita otro mundo y `/knockback reload` relee el archivo si lo
+  editaste a mano. El menú se genera por reflexión sobre la config, así que no puede desincronizarse:
+  añadir una opción añade su botón, y el comentario de la opción es su descripción.
+- **Sistema de knockback extendido**. `knockback.type` elige entre tres modelos, y todos los defaults
+  reproducen el comportamiento anterior:
     - **`SIMPLE`** — el de vanilla: divide el movimiento de la víctima por `friction` y suma knockback.
       Claves: `friction`, `horizontal`, `vertical`, `verticalLimit`, `extraHorizontal`, `extraVertical`,
       `slowdown`. Añade `enableOnePointSeven` + `onePointSevenMultiplier`: knockback horizontal reducido
