@@ -16,21 +16,30 @@ competitivos como Azurite.
   tres modelos, y todos los defaults reproducen el comportamiento anterior:
     - **`SIMPLE`** — el de vanilla: divide el movimiento de la víctima por `friction` y suma knockback.
       Claves: `friction`, `horizontal`, `vertical`, `verticalLimit`, `extraHorizontal`, `extraVertical`,
-      `slowdown`. Añade `enableOnePointSeven` + `onePointSevenMultiplier`: reduce el knockback horizontal
-      cuando el golpe entra por la espalda, como en 1.7, para que **perseguir a alguien que huye sea
-      posible** en vez de mandarlo volando en cada golpe.
-    - **`ADVANCED`** — fricción horizontal y vertical por separado, con modificadores según si la víctima
-      está en el suelo, en el aire o esprintando (`horizontalOnGround`, `verticalInAir`,
-      `horizontalSprinting`…), valor fijo de back-hit (`onePointSevenHorizontal`), límite vertical
-      opcional y deducción del encantamiento Knockback (`horizontalKnockbackDeduction`).
+      `slowdown`. Añade `enableOnePointSeven` + `onePointSevenMultiplier`: knockback horizontal reducido
+      en los golpes de persecución (ambos mirando hacia el mismo lado y la víctima esprintando), como en
+      1.7, para que **perseguir a alguien que huye sea posible** en vez de mandarlo volando cada vez.
+    - **`ADVANCED`** — el knockback sale **hacia donde mira el atacante** y se asigna en absoluto en vez de
+      sumarse al movimiento de la víctima, así que es predecible independientemente de dónde estén
+      colocados. Cada etapa es un multiplicador aparte: suelo/aire/sprint (`horizontalOnGround`,
+      `verticalInAir`, `horizontalSprinting`…), valor fijo de persecución (`onePointSevenHorizontal`),
+      `horizontalKnockbackDeduction` (**divide**: `horizontal *= (nivel+1) / deduction`, así que por
+      debajo de 1 refuerza todos los golpes) y `enableVerticalLimit`, que anula el movimiento vertical
+      cuando la víctima sube más de `verticalLimit` **por encima del atacante**.
     - **`CONSTANT`** — descarta por completo el movimiento previo de la víctima, así **cada golpe la manda
       exactamente igual de lejos** haga lo que haga. Es el más predecible para combear. Valores aparte
       para el golpe que resetea el sprint (`horizontalSprintReset`) y para víctimas que ya llevan rato en
       el aire (`verticalLongAir`), más `yawModifier`.
     - **Combo mode** (`knockback.combo`): mantiene a la víctima dentro de una caja golpeable en vez de
-      dejarla flotar fuera de alcance. `enabled`, `height`, `ticks`, `velocity`.
-    - **Arco** (`knockback.bow`): `horizontal`/`vertical` propios para flechazos, `punchMultiplier`, y
-      bow boosting (`boostHorizontal`, `boostVertical`, `boostDirectional`, `boostOnlyShooter`).
+      dejarla flotar fuera de alcance. Mide la altura **respecto al atacante** y sustituye el movimiento
+      vertical. `enabled`, `height`, `ticks`, `velocity`. Sólo aplica al modelo `ADVANCED`.
+    - **Arco** (`knockback.bow`, **activado por defecto**): vanilla calcula el knockback de flecha desde
+      **dónde está el arquero** cuando la flecha impacta, no desde la trayectoria de la flecha. Por eso
+      un arquero que se mueve tras disparar te tira de lado, y una flecha que te disparas a ti mismo te
+      manda en **dirección aleatoria** (arquero y víctima están en el mismo sitio y vanilla sortea la
+      dirección). Con `enabled: true` el knockback sigue la dirección real de la flecha.
+      Claves: `horizontal`, `vertical`, `punchMultiplier`, y bow boosting (`boostHorizontal`,
+      `boostVertical`, `boostDirectional`, `boostOnlyShooter`).
     - **Caña de pescar**: `rodHorizontalMultiplier`, `rodVerticalMultiplier`, `rodSpeedMultiplier`.
     - `cancelSprintOnHit`: corta el sprint de la víctima al recibir el golpe.
     - ⚠️ El knockback se configura aquí y **reemplaza** la sección `knockback` de `pandaspigot.yml`.
