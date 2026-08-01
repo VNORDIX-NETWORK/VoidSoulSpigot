@@ -6,14 +6,39 @@ competitivos como Azurite.
 
 ## Características propias (además de todo lo de PandaSpigot)
 
+- **Carpeta `VoidSoul/`**: `voidsoul.yml` y `pandaspigot.yml` viven ahí en vez de sueltos en la raíz
+  del servidor. Si vienes de una versión anterior, se mueven solos al arrancar (no pierdes tus
+  ajustes). `spigot.yml`, `bukkit.yml` y `paper.yml` se quedan donde estaban, porque son de
+  Spigot/Paper y hay plugins y paneles que los buscan ahí.
 - **`voidsoul.yml`**: archivo de configuración propio, con secciones por mundo (igual que `pandaspigot.yml`).
 - **Marca configurable** (`serverBrandName`): el nombre que aparece en el F3 del cliente y en `/version`.
-- **Sistema de knockback extendido** (por mundo, sección `knockback`):
-    - `friction`, `horizontal`, `vertical`, `verticalLimit`, `extraHorizontal`, `extraVertical`
-    - `slowdown`: multiplicador de frenado del atacante al conectar un golpe con knockback (vanilla `0.6`)
-    - Knockback de **caña de pescar** (`rodHorizontalMultiplier`, `rodVerticalMultiplier`)
+- **Sistema de knockback extendido** (por mundo, sección `knockback`). `knockback.type` elige entre
+  tres modelos, y todos los defaults reproducen el comportamiento anterior:
+    - **`SIMPLE`** — el de vanilla: divide el movimiento de la víctima por `friction` y suma knockback.
+      Claves: `friction`, `horizontal`, `vertical`, `verticalLimit`, `extraHorizontal`, `extraVertical`,
+      `slowdown`. Añade `enableOnePointSeven` + `onePointSevenMultiplier`: reduce el knockback horizontal
+      cuando el golpe entra por la espalda, como en 1.7, para que **perseguir a alguien que huye sea
+      posible** en vez de mandarlo volando en cada golpe.
+    - **`ADVANCED`** — fricción horizontal y vertical por separado, con modificadores según si la víctima
+      está en el suelo, en el aire o esprintando (`horizontalOnGround`, `verticalInAir`,
+      `horizontalSprinting`…), valor fijo de back-hit (`onePointSevenHorizontal`), límite vertical
+      opcional y deducción del encantamiento Knockback (`horizontalKnockbackDeduction`).
+    - **`CONSTANT`** — descarta por completo el movimiento previo de la víctima, así **cada golpe la manda
+      exactamente igual de lejos** haga lo que haga. Es el más predecible para combear. Valores aparte
+      para el golpe que resetea el sprint (`horizontalSprintReset`) y para víctimas que ya llevan rato en
+      el aire (`verticalLongAir`), más `yawModifier`.
+    - **Combo mode** (`knockback.combo`): mantiene a la víctima dentro de una caja golpeable en vez de
+      dejarla flotar fuera de alcance. `enabled`, `height`, `ticks`, `velocity`.
+    - **Arco** (`knockback.bow`): `horizontal`/`vertical` propios para flechazos, `punchMultiplier`, y
+      bow boosting (`boostHorizontal`, `boostVertical`, `boostDirectional`, `boostOnlyShooter`).
+    - **Caña de pescar**: `rodHorizontalMultiplier`, `rodVerticalMultiplier`, `rodSpeedMultiplier`.
+    - `cancelSprintOnHit`: corta el sprint de la víctima al recibir el golpe.
     - ⚠️ El knockback se configura aquí y **reemplaza** la sección `knockback` de `pandaspigot.yml`.
 - **Hit delay configurable** (`combat.hitDelayTicks`): ticks de invulnerabilidad entre golpes (vanilla `20`).
+    - `combat.hitDelayArrowTicks`: ventana propia para flechas. En 1.8, una flecha que llega dentro de la
+      ventana normal rebota y vuelve a dañar; darle un tick más que el melé lo evita. `-1` = usa el melé.
+    - `combat.maxAttacksPerSecond`: tope de golpes melé por segundo. Pone un techo a lo que gana un
+      autoclicker frente a una persona. `-1` lo desactiva. Es un límite tosco, **no** sustituye a un anticheat.
 - **Fixes de bugs de combate** (activables):
     - `combat.fixEatWhileSprinting`: evita mantener el sprint mientras se consume comida/pociones/leche
       (no afecta al bloqueo con espada, el block-hit sigue funcionando).
@@ -22,6 +47,11 @@ competitivos como Azurite.
   (`projectiles.snowballRandomness`, `eggRandomness`, `pearlRandomness`, `potionRandomness`;
   `1.0` = vanilla, `0.0` = trayectoria exacta).
 - **Daño de enderpearl configurable** (`projectiles.pearlDamage`, vanilla `5.0`, `0` lo desactiva).
+- **Lanzamiento de pociones configurable**: `projectiles.potionSpeed` (vanilla `0.5`),
+  `potionVerticalOffset` (vanilla `-20.0`, más negativo = arco más alto), `potionYOffset` y
+  `potionGravity` (vanilla `0.05`, más bajo = vuelo más plano y lejano).
+- **SnakeYAML 1.33** en vez de la 1.15 de 2014: los emoji en los configs de plugins ya no lanzan
+  `ReaderException` tumbando el plugin entero.
 - **Chunks**:
     - `chunks.maxUnloadsPerTick`: límite de chunks descargados por tick (vanilla/Spigot `100`).
     - `chunks.maxAutosaveChunksPerPass`: reactiva el límite incremental de autosave que Spigot

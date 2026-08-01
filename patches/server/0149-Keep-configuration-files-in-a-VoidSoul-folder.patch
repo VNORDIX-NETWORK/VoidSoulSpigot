@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 19:02:11 -0500
+Subject: [PATCH] Keep configuration files in a VoidSoul folder
+
+voidsoul.yml and pandaspigot.yml now live in VoidSoul/ instead of being
+scattered across the server root. A config left in the old location is
+moved on startup, so an existing server keeps its settings rather than
+silently regenerating defaults. Files pointed at explicitly with a command
+line flag are left alone.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfigFolder.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfigFolder.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..52e2c2babcd87b9952f1722866edb0d114370f54
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfigFolder.java
+@@ -0,0 +1,57 @@
++package com.voidsoul.spigot.config;
++
++import org.bukkit.Bukkit;
++
++import java.io.File;
++
++/**
++ * VoidSoulSpigot keeps its own configuration and PandaSpigot's together in one folder
++ * instead of scattering them across the server root.
++ */
++public final class VoidSoulConfigFolder {
++    /** Name of the folder, relative to the server root. */
++    public static final String NAME = "VoidSoul";
++
++    private VoidSoulConfigFolder() {
++    }
++
++    /**
++     * Creates the configuration folder if needed, and moves a config left over in the server
++     * root into it, so a server upgrading from an earlier build keeps its settings instead of
++     * silently regenerating defaults.
++     * <p>
++     * Files pointed at explicitly with a command line flag are left alone.
++     *
++     * @param file the configuration file that is about to be loaded
++     * @return {@code file}, for convenience
++     */
++    public static File prepare(File file) {
++        File folder = file.getParentFile();
++
++        // Only touch files that actually live in our folder; anything else was chosen
++        // deliberately by the server owner with a command line flag.
++        if (folder == null || !folder.getName().equals(NAME)) {
++            return file;
++        }
++
++        if (!folder.isDirectory() && !folder.mkdirs()) {
++            Bukkit.getLogger().warning("Could not create the " + NAME + " configuration folder.");
++            return file;
++        }
++
++        if (!file.exists()) {
++            File legacy = new File(file.getName());
++
++            if (legacy.isFile()) {
++                if (legacy.renameTo(file)) {
++                    Bukkit.getLogger().info("Moved " + legacy.getName() + " into " + NAME + "/");
++                } else {
++                    Bukkit.getLogger().warning("Could not move " + legacy.getName() + " into " + NAME
++                            + "/ - it will be regenerated with default values.");
++                }
++            }
++        }
++
++        return file;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/DedicatedServer.java b/src/main/java/net/minecraft/server/DedicatedServer.java
+index da8afb9d376a38638de154239307328b476f5a62..7f93ab92a42d7ca0cb499fabdefeba3f3b5d3e67 100644
+--- a/src/main/java/net/minecraft/server/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/DedicatedServer.java
+@@ -209,9 +209,9 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             }
+             bindAddress = new java.net.InetSocketAddress(inetaddress, this.R());
+             }
+-            com.hpfxd.pandaspigot.config.PandaSpigotConfig.init((File) options.valueOf("pandaspigot-settings"));
++            com.hpfxd.pandaspigot.config.PandaSpigotConfig.init(com.voidsoul.spigot.config.VoidSoulConfigFolder.prepare((File) options.valueOf("pandaspigot-settings"))); // VoidSoulSpigot - keep configs together
+             // PandaSpigot end
+-            com.voidsoul.spigot.config.VoidSoulConfig.init((File) options.valueOf("voidsoul-settings")); // VoidSoulSpigot
++            com.voidsoul.spigot.config.VoidSoulConfig.init(com.voidsoul.spigot.config.VoidSoulConfigFolder.prepare((File) options.valueOf("voidsoul-settings"))); // VoidSoulSpigot
+             // PaperSpigot start
+             org.github.paperspigot.PaperSpigotConfig.init((File) options.valueOf("paper-settings"));
+             org.github.paperspigot.PaperSpigotConfig.registerCommands();
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftServer.java b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+index 81ef1618772493119129f3dc7b8c5f2d7cd5843c..b907ac81153f959469522050b9f06b7a9671988f 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftServer.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftServer.java
+@@ -748,8 +748,8 @@ public final class CraftServer implements Server {
+ 
+         org.spigotmc.SpigotConfig.init((File) console.options.valueOf("spigot-settings")); // Spigot
+         org.github.paperspigot.PaperSpigotConfig.init((File) console.options.valueOf("paper-settings")); // PaperSpigot
+-        com.hpfxd.pandaspigot.config.PandaSpigotConfig.init((File) console.options.valueOf("pandaspigot-settings")); // PandaSpigot
+-        com.voidsoul.spigot.config.VoidSoulConfig.init((File) console.options.valueOf("voidsoul-settings")); // VoidSoulSpigot
++        com.hpfxd.pandaspigot.config.PandaSpigotConfig.init(com.voidsoul.spigot.config.VoidSoulConfigFolder.prepare((File) console.options.valueOf("pandaspigot-settings"))); // PandaSpigot // VoidSoulSpigot - keep configs together
++        com.voidsoul.spigot.config.VoidSoulConfig.init(com.voidsoul.spigot.config.VoidSoulConfigFolder.prepare((File) console.options.valueOf("voidsoul-settings"))); // VoidSoulSpigot
+         for (WorldServer world : console.worlds) {
+             world.worldData.setDifficulty(difficulty);
+             world.setSpawnFlags(monsters, animals);
+diff --git a/src/main/java/org/bukkit/craftbukkit/Main.java b/src/main/java/org/bukkit/craftbukkit/Main.java
+index a628a036a7a99ae99519e40315f3696d9fed6e43..df29eac98545c7784b2fdda56163f516fc07b105 100644
+--- a/src/main/java/org/bukkit/craftbukkit/Main.java
++++ b/src/main/java/org/bukkit/craftbukkit/Main.java
+@@ -137,14 +137,14 @@ public class Main {
+                 acceptsAll(asList("pandaspigot-settings"), "File for PandaSpigot settings")
+                         .withRequiredArg()
+                         .ofType(File.class)
+-                        .defaultsTo(new File("pandaspigot.yml"))
++                        .defaultsTo(new File(com.voidsoul.spigot.config.VoidSoulConfigFolder.NAME, "pandaspigot.yml")) // VoidSoulSpigot - keep configs together
+                         .describedAs("Yml file");
+ 
+                 // VoidSoulSpigot start
+                 acceptsAll(asList("voidsoul-settings"), "File for VoidSoulSpigot settings")
+                         .withRequiredArg()
+                         .ofType(File.class)
+-                        .defaultsTo(new File("voidsoul.yml"))
++                        .defaultsTo(new File(com.voidsoul.spigot.config.VoidSoulConfigFolder.NAME, "voidsoul.yml"))
+                         .describedAs("Yml file");
+                 // VoidSoulSpigot end
+ 

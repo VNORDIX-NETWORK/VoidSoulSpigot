@@ -1,0 +1,686 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 19:02:12 -0500
+Subject: [PATCH] Extended knockback models and PvP tuning
+
+Ports the option set competitive 1.8 forks expose, so knockback can be
+tuned to taste instead of only scaling vanilla's numbers.
+
+knockback.type picks between three models:
+  SIMPLE   - vanilla's, plus 1.7 style reduced knockback on back hits so
+             chasing a fleeing player is possible again
+  ADVANCED - separate horizontal/vertical friction with modifiers for
+             on-ground, in-air and sprinting states, a fixed back-hit
+             value, an optional vertical cap and a Knockback enchantment
+             deduction
+  CONSTANT - discards the victim's motion entirely so every hit travels
+             the same distance, with separate values for sprint-reset
+             hits and for victims already airborne
+
+Also adds combo mode, arrow knockback with bow boosting, a fishing rod
+speed multiplier, configurable splash potion throwing, a separate
+invulnerability window for arrows, and an optional attacks-per-second cap.
+
+All defaults reproduce the previous behaviour.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index c2718fad5eed5ec4d38a6e71efd4d408c0698f8c..d29c3ecf8d53a95b0856d8d9ccca370540c482c3 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -16,6 +16,18 @@ public class VoidSoulWorldConfig {
+                 "Plugins can still override this per-entity (maxNoDamageTicks).")
+         public int hitDelayTicks = 20;
+ 
++        @Comment("Separate invulnerability window for arrow hits. 1.8 lets an arrow that\n" +
++                "lands during the normal window bounce off and re-damage the victim; giving\n" +
++                "arrows one tick more than hitDelayTicks avoids that. Negative values reuse\n" +
++                "hitDelayTicks.")
++        public int hitDelayArrowTicks = -1;
++
++        @Comment("Maximum melee attacks a player may land per second. Extra swings within\n" +
++                "the same second are ignored, which puts a ceiling on what an autoclicker\n" +
++                "gains over a human. -1 disables the cap.\n" +
++                "This is a blunt limit, not a replacement for an anticheat.")
++        public int maxAttacksPerSecond = -1;
++
+         @Comment("Prevents players from keeping sprint while consuming food, potions or\n" +
+                 "milk (the \"run and eat\" exploit). Sword blocking and bow drawing are\n" +
+                 "not affected, so block-hitting keeps working.")
+@@ -31,8 +43,30 @@ public class VoidSoulWorldConfig {
+             "section that previously lived in pandaspigot.yml.")
+     public KnockbackConfig knockback;
+ 
++    public enum KnockbackType {
++        /** Vanilla's model: divide the current motion by a friction value, then add knockback. */
++        SIMPLE,
++        /** Motion is scaled by separate horizontal/vertical friction, with per-state modifiers. */
++        ADVANCED,
++        /** Motion is discarded and replaced with fixed values, so every hit lands the same. */
++        CONSTANT
++    }
++
+     @ConfigSerializable
+     public static class KnockbackConfig {
++        @Comment("Which knockback model to use:\n" +
++                "  SIMPLE   - vanilla's model, tuned by the values right below. Divides the\n" +
++                "             victim's motion by \"friction\" and then adds knockback.\n" +
++                "  ADVANCED - the \"advanced\" section below. Scales horizontal and vertical\n" +
++                "             motion separately and applies modifiers for whether the victim\n" +
++                "             is on the ground, in the air or sprinting.\n" +
++                "  CONSTANT - the \"constant\" section below. Throws the victim's existing\n" +
++                "             motion away entirely, so every hit sends them the same distance\n" +
++                "             no matter what they were doing. The most predictable to combo.")
++        public KnockbackType type = KnockbackType.SIMPLE;
++
++        // ---- SIMPLE ----------------------------------------------------------------
++
+         public double friction = 2.0;
+         public double horizontal = 0.4;
+         public double vertical = 0.4;
+@@ -45,10 +79,163 @@ public class VoidSoulWorldConfig {
+                 "Vanilla: 0.6 (lower values slow the attacker down more)")
+         public double slowdown = 0.6;
+ 
++        @Comment("Reduce horizontal knockback when the hit lands on the victim's back, the\n" +
++                "way 1.7 did. Makes chasing a fleeing player much easier, because they no\n" +
++                "longer get launched away from you every time you connect.")
++        public boolean enableOnePointSeven = false;
++
++        @Comment("Multiplier applied to horizontal knockback on a back hit when\n" +
++                "enableOnePointSeven is on. Lower means the victim is pushed less.")
++        public double onePointSevenMultiplier = 0.4;
++
++        // ---- shared ----------------------------------------------------------------
++
++        @Comment("Stop the victim sprinting when they get hit. Applies to every knockback\n" +
++                "model.")
++        public boolean cancelSprintOnHit = false;
++
+         @Comment("Multipliers applied to the velocity an entity receives when hit by a\n" +
+                 "fishing rod hook. 1.0 is vanilla behaviour.")
+         public double rodHorizontalMultiplier = 1.0;
+         public double rodVerticalMultiplier = 1.0;
++
++        @Comment("Multiplier applied to the whole rod velocity vector, on top of the two\n" +
++                "values above.")
++        public double rodSpeedMultiplier = 1.0;
++
++        @Comment("Knockback model used when the victim is hit by an arrow.")
++        public BowConfig bow;
++
++        @Comment("Settings for the ADVANCED knockback model. Only read when type is\n" +
++                "ADVANCED.")
++        public AdvancedConfig advanced;
++
++        @Comment("Settings for the CONSTANT knockback model. Only read when type is\n" +
++                "CONSTANT.")
++        public ConstantConfig constant;
++
++        @Comment("Combo mode keeps a victim inside a hittable box so they can be chained,\n" +
++                "instead of floating out of reach after a few hits.")
++        public ComboConfig combo;
++    }
++
++    @ConfigSerializable
++    public static class AdvancedConfig {
++        public double horizontal = 0.45;
++
++        @Comment("Horizontal knockback multiplier while the victim is standing on ground.")
++        public double horizontalOnGround = 1.1;
++
++        @Comment("Horizontal knockback multiplier while the victim is sprinting.")
++        public double horizontalSprinting = 0.95;
++
++        @Comment("Keep part of the victim's existing horizontal motion instead of zeroing\n" +
++                "it. When off, horizontal motion is discarded before knockback is applied.")
++        public boolean horizontalInherit = true;
++
++        @Comment("How much of the victim's horizontal motion is kept when\n" +
++                "horizontalInherit is on. 0 keeps none, 1 keeps all of it.")
++        public double horizontalFriction = 0.35;
++
++        @Comment("Subtracted from the Knockback enchantment level, so a hit with\n" +
++                "Knockback II is worth (2 + 1) - value levels of extra knockback instead\n" +
++                "of the full amount.")
++        public double horizontalKnockbackDeduction = 0.8;
++
++        public double vertical = 0.35;
++
++        @Comment("Vertical knockback multiplier while the victim is standing on ground.")
++        public double verticalOnGround = 1.1;
++
++        @Comment("Vertical knockback multiplier while the victim is airborne.")
++        public double verticalInAir = 0.85;
++
++        @Comment("Vertical knockback multiplier while the victim is sprinting.")
++        public double verticalSprinting = 1.0;
++
++        @Comment("Keep part of the victim's existing vertical motion instead of zeroing it.")
++        public boolean verticalInherit = false;
++
++        @Comment("How much of the victim's vertical motion is kept when verticalInherit\n" +
++                "is on.")
++        public double verticalFriction = 0.35;
++
++        @Comment("Use a fixed horizontal knockback on a back hit, the way 1.7 did.")
++        public boolean enableOnePointSeven = true;
++
++        @Comment("Horizontal knockback used on a back hit. Replaces the computed value\n" +
++                "rather than multiplying it.")
++        public double onePointSevenHorizontal = 0.37;
++
++        @Comment("Cap vertical knockback at verticalLimit.")
++        public boolean enableVerticalLimit = false;
++        public double verticalLimit = 1.2;
++
++        @Comment("Multiplier applied to the attacker's motion after a knockback hit.")
++        public double slowdown = 0.6;
++    }
++
++    @ConfigSerializable
++    public static class ConstantConfig {
++        public double horizontal = 0.527375;
++        public double vertical = 0.361375;
++
++        @Comment("Vertical knockback used once the victim has been off the ground for\n" +
++                "longer than 20 ticks, so players who are already flying away don't get\n" +
++                "launched further.")
++        public double verticalLongAir = 0.1;
++
++        @Comment("Horizontal knockback used when the attacker was sprinting, which is the\n" +
++                "hit that also resets their sprint.")
++        public double horizontalSprintReset = 0.8545;
++
++        @Comment("Extra horizontal knockback based on how far the victim is turned away\n" +
++                "from the attacker. 0 disables it, 1 adds up to a full extra hit's worth\n" +
++                "when they are facing directly away.")
++        public double yawModifier = 0.0;
++    }
++
++    @ConfigSerializable
++    public static class BowConfig {
++        @Comment("Horizontal and vertical knockback applied when an arrow hits. Negative\n" +
++                "values mean \"use the normal melee knockback instead\".")
++        public double horizontal = -1.0;
++        public double vertical = -1.0;
++
++        @Comment("Multiplier on the Punch enchantment's knockback:\n" +
++                "horizontal *= (punchLevel + 1) * multiplier")
++        public double punchMultiplier = 1.0;
++
++        @Comment("Bow boosting is a player launching themselves with their own arrow.\n" +
++                "Negative values mean \"treat it like any other arrow hit\".")
++        public double boostHorizontal = -1.0;
++        public double boostVertical = -1.0;
++
++        @Comment("Launch the player along the direction they are facing rather than away\n" +
++                "from the arrow.")
++        public boolean boostDirectional = true;
++
++        @Comment("Only give the boost values to the player who fired the arrow. When off,\n" +
++                "anyone the arrow hits gets them.")
++        public boolean boostOnlyShooter = true;
++    }
++
++    @ConfigSerializable
++    public static class ComboConfig {
++        @Comment("Enable combo mode.")
++        public boolean enabled = false;
++
++        @Comment("How high above the ground the victim may be carried by knockback while\n" +
++                "a combo is running. Above this, downward velocity is applied to pull them\n" +
++                "back into range.")
++        public double height = 2.3;
++
++        @Comment("How many ticks after a hit the victim still counts as being combo'd.")
++        public int ticks = 10;
++
++        @Comment("Vertical velocity added on each hit above the height limit. Negative\n" +
++                "pulls the victim down.")
++        public double velocity = -0.05;
+     }
+ 
+     @Comment("Projectile behaviour settings.")
+@@ -67,6 +254,22 @@ public class VoidSoulWorldConfig {
+         @Comment("Fall damage dealt to a player when teleporting with an ender pearl.\n" +
+                 "Vanilla: 5.0. Set to 0 to disable pearl damage.")
+         public double pearlDamage = 5.0;
++
++        @Comment("Speed a splash potion is thrown at. Vanilla: 0.5. Higher throws further\n" +
++                "and flatter.")
++        public double potionSpeed = 0.5;
++
++        @Comment("Vertical angle offset applied when throwing a splash potion, in degrees.\n" +
++                "Vanilla: -20.0. More negative arcs the throw higher.")
++        public double potionVerticalOffset = -20.0;
++
++        @Comment("Extra height the potion is spawned at, relative to the thrower's hand.\n" +
++                "Vanilla: 0.0.")
++        public double potionYOffset = 0.0;
++
++        @Comment("Downward acceleration applied to a thrown splash potion each tick.\n" +
++                "Vanilla: 0.05. Lower makes potions fly flatter and land further away.")
++        public double potionGravity = 0.05;
+     }
+ 
+     @Comment("Chunk system performance settings.")
+diff --git a/src/main/java/net/minecraft/server/EntityArrow.java b/src/main/java/net/minecraft/server/EntityArrow.java
+index ecde0d9ec034024355c09b249694ce118b3b10bc..763e6208d36e5f1c7659df44b35854111314575d 100644
+--- a/src/main/java/net/minecraft/server/EntityArrow.java
++++ b/src/main/java/net/minecraft/server/EntityArrow.java
+@@ -279,7 +279,10 @@ public class EntityArrow extends Entity implements IProjectile {
+                             if (this.knockbackStrength > 0) {
+                                 f3 = MathHelper.sqrt(this.motX * this.motX + this.motZ * this.motZ);
+                                 if (f3 > 0.0F) {
+-                                    movingobjectposition.entity.g(this.motX * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3, 0.1D, this.motZ * (double) this.knockbackStrength * 0.6000000238418579D / (double) f3);
++                                    // VoidSoulSpigot start - configurable Punch knockback
++                                    double punch = (double) this.knockbackStrength * this.world.voidsoulConfig.knockback.bow.punchMultiplier;
++                                    movingobjectposition.entity.g(this.motX * punch * 0.6000000238418579D / (double) f3, 0.1D, this.motZ * punch * 0.6000000238418579D / (double) f3);
++                                    // VoidSoulSpigot end
+                                 }
+                             }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityFishingHook.java b/src/main/java/net/minecraft/server/EntityFishingHook.java
+index 338715235d1197c9c0b99fa9819190be1bb738f0..a075e72594e568042207efcf90a267308e6a87fc 100644
+--- a/src/main/java/net/minecraft/server/EntityFishingHook.java
++++ b/src/main/java/net/minecraft/server/EntityFishingHook.java
+@@ -211,10 +211,12 @@ public class EntityFishingHook extends Entity {
+                         this.hooked = movingobjectposition.entity;
+                         // VoidSoulSpigot start - configurable rod knockback
+                         com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = this.world.voidsoulConfig.knockback;
+-                        if (knockbackConfig.rodHorizontalMultiplier != 1.0D || knockbackConfig.rodVerticalMultiplier != 1.0D) {
+-                            this.hooked.motX *= knockbackConfig.rodHorizontalMultiplier;
+-                            this.hooked.motZ *= knockbackConfig.rodHorizontalMultiplier;
+-                            this.hooked.motY *= knockbackConfig.rodVerticalMultiplier;
++                        double rodHorizontal = knockbackConfig.rodHorizontalMultiplier * knockbackConfig.rodSpeedMultiplier;
++                        double rodVertical = knockbackConfig.rodVerticalMultiplier * knockbackConfig.rodSpeedMultiplier;
++                        if (rodHorizontal != 1.0D || rodVertical != 1.0D) {
++                            this.hooked.motX *= rodHorizontal;
++                            this.hooked.motZ *= rodHorizontal;
++                            this.hooked.motY *= rodVertical;
+                             this.hooked.velocityChanged = true;
+                         }
+                         // VoidSoulSpigot end
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 91fccca78e44625c0a502197ff9c09933d553628..da55a4df9a0e3e64a72896680c7e0b0513f8af92 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -1021,13 +1021,25 @@ public abstract class EntityHuman extends EntityLiving {
+                         if (i > 0) {
+                             // PandaSpigot start - Configurable knockback // VoidSoulSpigot - moved to voidsoul.yml, configurable slowdown
+                             com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = entity.world.voidsoulConfig.knockback;
++                            // VoidSoulSpigot start - per-model extra knockback
++                            boolean advancedKnockback = knockbackConfig.type == com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackType.ADVANCED
++                                    && knockbackConfig.advanced != null;
++                            // The ADVANCED model rates a Knockback hit as ((level + 1) - deduction)
++                            // levels instead of the full amount, so enchanted weapons don't
++                            // launch a victim clean out of combo range.
++                            double levels = advancedKnockback
++                                    ? Math.max(0.0D, (i + 1) - knockbackConfig.advanced.horizontalKnockbackDeduction)
++                                    : (double) i;
++                            double slowdown = advancedKnockback ? knockbackConfig.advanced.slowdown : knockbackConfig.slowdown;
++
+                             entity.g(
+-                                    -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal,
++                                    -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * levels * knockbackConfig.extraHorizontal,
+                                     knockbackConfig.extraVertical,
+-                                    MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * (float) i * knockbackConfig.extraHorizontal);
++                                    MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * levels * knockbackConfig.extraHorizontal);
+                             // PandaSpigot end
+-                            this.motX *= knockbackConfig.slowdown; // VoidSoulSpigot - configurable slowdown
+-                            this.motZ *= knockbackConfig.slowdown; // VoidSoulSpigot - configurable slowdown
++                            this.motX *= slowdown;
++                            this.motZ *= slowdown;
++                            // VoidSoulSpigot end
+                             this.setSprinting(false);
+                         }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index e621ce664817f64b480ee9a5da0065e5da674d49..aa1ebdad12b12f3fd18d11567586bf8e84bb5f84 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -754,7 +754,12 @@ public abstract class EntityLiving extends Entity {
+                         return false;
+                     }
+                     this.lastDamage = f;
+-                    this.noDamageTicks = this.maxNoDamageTicks;
++                    // VoidSoulSpigot start - separate invulnerability window for arrows
++                    int arrowDelay = this.world.voidsoulConfig.combat.hitDelayArrowTicks;
++                    this.noDamageTicks = arrowDelay >= 0 && damagesource.i() instanceof EntityArrow
++                            ? arrowDelay
++                            : this.maxNoDamageTicks;
++                    // VoidSoulSpigot end
+                     // CraftBukkit end
+                     this.hurtTicks = this.av = 10;
+                 }
+@@ -808,7 +813,14 @@ public abstract class EntityLiving extends Entity {
+                         }
+ 
+                         this.aw = (float) (MathHelper.b(d1, d0) * 180.0D / 3.1415927410125732D - (double) this.yaw);
+-                        this.a(entity, f, d0, d1);
++                        // VoidSoulSpigot start - let the knockback model see what dealt the damage
++                        this.setKnockbackSource(damagesource);
++                        try {
++                            this.a(entity, f, d0, d1);
++                        } finally {
++                            this.setKnockbackSource(null);
++                        }
++                        // VoidSoulSpigot end
+                     } else {
+                         this.aw = (float) ((int) (Math.random() * 2.0D) * 180);
+                     }
+@@ -905,24 +917,217 @@ public abstract class EntityLiving extends Entity {
+             // PandaSpigot start - Configurable knockback // VoidSoulSpigot - moved to voidsoul.yml
+             com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig knockbackConfig = entity.world.voidsoulConfig.knockback;
+             double magnitude = MathHelper.sqrt(d0 * d0 + d1 * d1);
+-    
+-            double friction = knockbackConfig.friction;
+-            this.motX /= friction;
+-            this.motY /= friction;
+-            this.motZ /= friction;
+-    
+-            this.motX -= d0 / magnitude * knockbackConfig.horizontal;
+-            this.motY += knockbackConfig.vertical;
+-            this.motZ -= d1 / magnitude * knockbackConfig.horizontal;
+-    
+-            if (this.motY > knockbackConfig.verticalLimit) {
+-                this.motY = knockbackConfig.verticalLimit;
++
++            // VoidSoulSpigot start - selectable knockback models
++            if (magnitude <= 0.0D) {
++                magnitude = 1.0D;
++            }
++
++            if (this.applyBowKnockback(knockbackConfig, d0, d1, magnitude)) {
++                // handled as an arrow hit
++            } else {
++                switch (knockbackConfig.type) {
++                    case ADVANCED:
++                        this.applyAdvancedKnockback(knockbackConfig.advanced, entity, d0, d1, magnitude);
++                        break;
++                    case CONSTANT:
++                        this.applyConstantKnockback(knockbackConfig.constant, entity, d0, d1, magnitude);
++                        break;
++                    default:
++                        this.applySimpleKnockback(knockbackConfig, entity, d0, d1, magnitude);
++                        break;
++                }
+             }
++
++            this.applyComboLimit(knockbackConfig.combo);
++
++            if (knockbackConfig.cancelSprintOnHit) {
++                this.setSprinting(false);
++            }
++            // VoidSoulSpigot end
+             // PandaSpigot end
+ 
+         }
+     }
+ 
++    // VoidSoulSpigot start - selectable knockback models
++    /** The damage source of the hit currently being processed, so knockback can tell an arrow apart from a sword. */
++    private DamageSource knockbackSource;
++    /** Ticks the entity has spent off the ground, used by the CONSTANT model. */
++    public int airTicks;
++    /** Tick of the last hit taken, used by combo mode. */
++    private int lastComboTick = Integer.MIN_VALUE;
++    /** Ground height recorded when the current combo started. */
++    private double comboGroundY;
++
++    void setKnockbackSource(DamageSource damagesource) {
++        this.knockbackSource = damagesource;
++    }
++
++    /**
++     * @return whether the attacker is behind the victim, i.e. the victim is looking away
++     *         from them. 1.7 used a weaker horizontal knockback for these hits, which is
++     *         what makes chasing a fleeing player feel possible.
++     */
++    private boolean isBackHit(Entity attacker) {
++        if (attacker == null) {
++            return false;
++        }
++
++        double dx = attacker.locX - this.locX;
++        double dz = attacker.locZ - this.locZ;
++
++        if (dx == 0.0D && dz == 0.0D) {
++            return false;
++        }
++
++        float yawToAttacker = (float) (Math.atan2(-dx, dz) * 180.0D / Math.PI);
++        return Math.abs(MathHelper.g(yawToAttacker - this.yaw)) > 90.0F;
++    }
++
++    private void applySimpleKnockback(com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig config, Entity attacker, double d0, double d1, double magnitude) {
++        double horizontal = config.horizontal;
++
++        if (config.enableOnePointSeven && this.isBackHit(attacker)) {
++            horizontal *= config.onePointSevenMultiplier;
++        }
++
++        double friction = config.friction;
++        this.motX /= friction;
++        this.motY /= friction;
++        this.motZ /= friction;
++
++        this.motX -= d0 / magnitude * horizontal;
++        this.motY += config.vertical;
++        this.motZ -= d1 / magnitude * horizontal;
++
++        if (this.motY > config.verticalLimit) {
++            this.motY = config.verticalLimit;
++        }
++    }
++
++    private void applyAdvancedKnockback(com.voidsoul.spigot.config.VoidSoulWorldConfig.AdvancedConfig config, Entity attacker, double d0, double d1, double magnitude) {
++        double horizontal = config.horizontal;
++        double vertical = config.vertical;
++
++        if (this.onGround) {
++            horizontal *= config.horizontalOnGround;
++            vertical *= config.verticalOnGround;
++        } else {
++            vertical *= config.verticalInAir;
++        }
++
++        if (this.isSprinting()) {
++            horizontal *= config.horizontalSprinting;
++            vertical *= config.verticalSprinting;
++        }
++
++        if (config.enableOnePointSeven && this.isBackHit(attacker)) {
++            horizontal = config.onePointSevenHorizontal;
++        }
++
++        this.motX = config.horizontalInherit ? this.motX * config.horizontalFriction : 0.0D;
++        this.motZ = config.horizontalInherit ? this.motZ * config.horizontalFriction : 0.0D;
++        this.motY = config.verticalInherit ? this.motY * config.verticalFriction : 0.0D;
++
++        this.motX -= d0 / magnitude * horizontal;
++        this.motZ -= d1 / magnitude * horizontal;
++        this.motY += vertical;
++
++        if (config.enableVerticalLimit && this.motY > config.verticalLimit) {
++            this.motY = config.verticalLimit;
++        }
++    }
++
++    private void applyConstantKnockback(com.voidsoul.spigot.config.VoidSoulWorldConfig.ConstantConfig config, Entity attacker, double d0, double d1, double magnitude) {
++        // A sprinting attacker is the one whose sprint gets reset by the hit.
++        boolean sprintReset = attacker instanceof EntityLiving && ((EntityLiving) attacker).isSprinting();
++
++        double horizontal = sprintReset ? config.horizontalSprintReset : config.horizontal;
++        double vertical = this.airTicks >= 20 ? config.verticalLongAir : config.vertical;
++
++        if (config.yawModifier != 0.0D && attacker != null) {
++            // 0 when the victim faces the attacker, 1 when they are turned fully away.
++            double turnedAway = Math.abs(MathHelper.g(this.yaw - attacker.yaw)) / 180.0D;
++            horizontal += horizontal * config.yawModifier * turnedAway;
++        }
++
++        this.motX = 0.0D;
++        this.motY = 0.0D;
++        this.motZ = 0.0D;
++
++        this.motX -= d0 / magnitude * horizontal;
++        this.motZ -= d1 / magnitude * horizontal;
++        this.motY += vertical;
++    }
++
++    /**
++     * Applies the bow knockback overrides when the hit came from an arrow.
++     *
++     * @return whether this hit was handled here, so the melee models are skipped
++     */
++    private boolean applyBowKnockback(com.voidsoul.spigot.config.VoidSoulWorldConfig.KnockbackConfig config, double d0, double d1, double magnitude) {
++        com.voidsoul.spigot.config.VoidSoulWorldConfig.BowConfig bow = config.bow;
++        DamageSource source = this.knockbackSource;
++
++        if (bow == null || source == null || !(source.i() instanceof EntityArrow)) {
++            return false;
++        }
++
++        EntityArrow arrow = (EntityArrow) source.i();
++        boolean boosting = arrow.shooter == this;
++        boolean useBoost = boosting || !bow.boostOnlyShooter;
++
++        double horizontal = useBoost && bow.boostHorizontal >= 0.0D ? bow.boostHorizontal : bow.horizontal;
++        double vertical = useBoost && bow.boostVertical >= 0.0D ? bow.boostVertical : bow.vertical;
++
++        if (horizontal < 0.0D && vertical < 0.0D) {
++            return false; // nothing overridden, fall through to the melee model
++        }
++
++        if (horizontal < 0.0D) horizontal = config.horizontal;
++        if (vertical < 0.0D) vertical = config.vertical;
++
++        this.motX = 0.0D;
++        this.motY = 0.0D;
++        this.motZ = 0.0D;
++
++        if (boosting && bow.boostDirectional) {
++            // Launch along the player's own facing rather than away from the arrow.
++            this.motX += -MathHelper.sin(this.yaw * 3.1415927F / 180.0F) * horizontal;
++            this.motZ += MathHelper.cos(this.yaw * 3.1415927F / 180.0F) * horizontal;
++        } else {
++            this.motX -= d0 / magnitude * horizontal;
++            this.motZ -= d1 / magnitude * horizontal;
++        }
++
++        this.motY += vertical;
++        return true;
++    }
++
++    /**
++     * Keeps a victim who is already being combo'd within reach, by pulling them back down
++     * once knockback has carried them above the configured height.
++     */
++    private void applyComboLimit(com.voidsoul.spigot.config.VoidSoulWorldConfig.ComboConfig config) {
++        if (config == null || !config.enabled) {
++            return;
++        }
++
++        int now = MinecraftServer.currentTick;
++
++        if (now - this.lastComboTick > config.ticks) {
++            this.comboGroundY = this.locY; // new combo, remember where it started
++        }
++
++        this.lastComboTick = now;
++
++        if (this.locY - this.comboGroundY > config.height) {
++            this.motY += config.velocity;
++        }
++    }
++    // VoidSoulSpigot end
++
+     protected String bo() {
+         return "game.neutral.hurt";
+     }
+@@ -1478,6 +1683,8 @@ public abstract class EntityLiving extends Entity {
+ 
+     public void t_() {
+         super.t_();
++        // VoidSoulSpigot - track how long the entity has been airborne, for CONSTANT knockback
++        this.airTicks = this.onGround ? 0 : this.airTicks + 1;
+         if (!this.world.isClientSide) {
+             int i = this.bv();
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityPotion.java b/src/main/java/net/minecraft/server/EntityPotion.java
+index 8f3a161010e6e4f850ac81ffe903e97ca1c31753..6c5aa548afb0748837a7a173eeda1c8c06028887 100644
+--- a/src/main/java/net/minecraft/server/EntityPotion.java
++++ b/src/main/java/net/minecraft/server/EntityPotion.java
+@@ -25,6 +25,12 @@ public class EntityPotion extends EntityProjectile {
+     public EntityPotion(World world, EntityLiving entityliving, ItemStack itemstack) {
+         super(world, entityliving);
+         this.item = itemstack;
++        // VoidSoulSpigot start - configurable throwing height
++        double yOffset = world.voidsoulConfig.projectiles.potionYOffset;
++        if (yOffset != 0.0D) {
++            this.setPosition(this.locX, this.locY + yOffset, this.locZ);
++        }
++        // VoidSoulSpigot end
+     }
+ 
+     // VoidSoulSpigot start - configurable projectile trajectory randomness
+@@ -39,17 +45,19 @@ public class EntityPotion extends EntityProjectile {
+         this.item = itemstack;
+     }
+ 
++    // VoidSoulSpigot start - configurable splash potion throwing
+     protected float m() {
+-        return 0.05F;
++        return (float) this.world.voidsoulConfig.projectiles.potionGravity;
+     }
+ 
+     protected float j() {
+-        return 0.5F;
++        return (float) this.world.voidsoulConfig.projectiles.potionSpeed;
+     }
+ 
+     protected float l() {
+-        return -20.0F;
++        return (float) this.world.voidsoulConfig.projectiles.potionVerticalOffset;
+     }
++    // VoidSoulSpigot end
+ 
+     public void setPotionValue(int i) {
+         if (this.item == null) {
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index e2bdac9a7050df45059c25442ceb320eb9f17ba1..a71c1b39cb20342a12724d4cff74eabfe9426e4e 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -78,6 +78,10 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+     public final NetworkManager networkManager;
+     private final MinecraftServer minecraftServer;
+     public EntityPlayer player;
++    // VoidSoulSpigot start - optional cap on attacks per second
++    private int attackWindowStart;
++    private int attacksThisWindow;
++    // VoidSoulSpigot end
+     private int e;
+     private int f;
+     private int g;
+@@ -1416,6 +1420,20 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                         return;
+                     }
+ 
++                    // VoidSoulSpigot start - optional cap on attacks per second
++                    int cpsCap = this.player.world.voidsoulConfig.combat.maxAttacksPerSecond;
++                    if (cpsCap >= 0) {
++                        if (MinecraftServer.currentTick - this.attackWindowStart >= 20) {
++                            this.attackWindowStart = MinecraftServer.currentTick;
++                            this.attacksThisWindow = 0;
++                        }
++
++                        if (++this.attacksThisWindow > cpsCap) {
++                            return;
++                        }
++                    }
++                    // VoidSoulSpigot end
++
+                     this.player.attack(entity);
+ 
+                     // CraftBukkit start

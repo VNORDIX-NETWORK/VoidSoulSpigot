@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 18:53:25 -0500
+Subject: [PATCH] Update SnakeYAML to 1.33
+
+SnakeYAML 1.15 dates from 2014 and rejects UTF-16 surrogate pairs, so a
+single emoji anywhere in a plugin's config throws ReaderException and
+takes the whole plugin down with it. 1.33 checks printability per code
+point instead, so supplementary characters load fine.
+
+Staying on the 1.x line keeps the no-arg Representer and SafeConstructor
+constructors that plugins compiled against 1.15 still call. The document
+size limit added in 1.32 defaults to 3 MB, which is fine for a config but
+not for the player data files some plugins accumulate, so YamlConstructor
+lifts it.
+
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 6e727d855493daeae6a2d8e649fad95ea25db1ce..1eeb6be27a385bfd9fbca03368574d43daf3e9c0 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -16,7 +16,11 @@ dependencies {
+     api("com.googlecode.json-simple:json-simple:1.1.1") {
+         isTransitive = false
+     }
+-    api("org.yaml:snakeyaml:1.15")
++    // VoidSoulSpigot - Update SnakeYAML. 1.15 rejects UTF-16 surrogate pairs, so a single
++    // emoji anywhere in a plugin's config throws and takes the whole plugin down. Staying on
++    // the 1.x line keeps the no-arg Representer/SafeConstructor constructors that plugins
++    // compiled against 1.15 still call.
++    api("org.yaml:snakeyaml:1.33")
+     api("net.md-5:bungeecord-chat:1.8-SNAPSHOT")
+     // PandaSpigot start - Adventure
+     api("net.kyori:adventure-api:$adventureVersion")
+@@ -71,7 +75,7 @@ tasks {
+ 
+             it.links(
+                 "https://guava.dev/releases/17.0/api/docs/",
+-                "https://javadoc.io/doc/org.yaml/snakeyaml/1.15/",
++                "https://javadoc.io/doc/org.yaml/snakeyaml/1.33/",
+                 "https://javadoc.io/doc/com.google.code.gson/gson/2.2.4/",
+                 "https://repo.hpfxd.com/javadoc/releases/net/md-5/bungeecord-chat/1.8-SNAPSHOT/raw/",
+                 "https://javadoc.io/doc/org.slf4j/slf4j-api/1.7.35/", // PandaSpigot - Add SLF4J Logger
+diff --git a/src/main/java/org/bukkit/configuration/file/YamlConstructor.java b/src/main/java/org/bukkit/configuration/file/YamlConstructor.java
+index 73ad722a82f3f5429a67585d426f7b023d1420ba..4dd65fd0f2b0ac86267003b64cc36519aafdafd3 100644
+--- a/src/main/java/org/bukkit/configuration/file/YamlConstructor.java
++++ b/src/main/java/org/bukkit/configuration/file/YamlConstructor.java
+@@ -3,6 +3,7 @@ package org.bukkit.configuration.file;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ 
++import org.yaml.snakeyaml.LoaderOptions;
+ import org.yaml.snakeyaml.nodes.Node;
+ import org.yaml.snakeyaml.constructor.SafeConstructor;
+ import org.yaml.snakeyaml.error.YAMLException;
+@@ -12,7 +13,18 @@ import org.bukkit.configuration.serialization.ConfigurationSerialization;
+ 
+ public class YamlConstructor extends SafeConstructor {
+ 
++    // VoidSoulSpigot start - lift the document size limit SnakeYAML added in 1.32.
++    // It defaults to 3 MB, which is plenty for a config but not for the player data
++    // files some plugins accumulate, and hitting it would look like config corruption.
++    private static LoaderOptions loaderOptions() {
++        LoaderOptions options = new LoaderOptions();
++        options.setCodePointLimit(Integer.MAX_VALUE);
++        return options;
++    }
++    // VoidSoulSpigot end
++
+     public YamlConstructor() {
++        super(loaderOptions()); // VoidSoulSpigot - lift document size limit
+         this.yamlConstructors.put(Tag.MAP, new ConstructCustomObject());
+     }
+ 
