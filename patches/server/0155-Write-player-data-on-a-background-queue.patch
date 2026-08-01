@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 22:19:56 -0500
+Subject: [PATCH] Write player data on a background queue
+
+An autosave calls savePlayers(), which writes an NBT file for every online
+player back to back in a single tick. With a few hundred players that
+stalls the server for as long as the disk takes.
+
+The compound is still built on the main thread, so what gets written is
+the state at the moment of the save; only the write is handed to a single
+writer thread. That thread keeps writes for the same file in submission
+order, so a later save can never be overwritten by an earlier one, and
+data still sitting in the queue is readable, so a player who reconnects
+before their save flushed reads their newest inventory rather than what is
+on disk. The queue is drained before the server stops.
+
+Controlled by saving.asyncPlayerData, on by default.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 9ba484bc107bdac268cfdf235a30480179d985ab..c71fd128b224ebe62a83f866e70f388db1f14d56 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -148,6 +148,32 @@ public class VoidSoulConfig {
+             "and used as the server name by plugins.")
+     public String serverBrandName = "VoidSoulSpigot";
+ 
++    /**
++     * @return Whether player data writes are handed to the save queue. Safe to call before
++     *         the config is loaded.
++     */
++    public static boolean isAsyncPlayerDataSave() {
++        return config == null || config.saving == null || config.saving.asyncPlayerData;
++    }
++
++    @Comment("Disk writes.")
++    public SavingConfig saving = new SavingConfig();
++
++    @ConfigSerializable
++    public static class SavingConfig {
++        @Comment("Write player data on a background thread instead of blocking the server.\n" +
++                "\n" +
++                "An autosave writes a file for every online player in a single tick, so with\n" +
++                "a few hundred players online the server stops for as long as the disk takes.\n" +
++                "The data is still built on the main thread, so what gets written is exactly\n" +
++                "the state at the moment of the save; only the write is moved off it.\n" +
++                "\n" +
++                "Writes for the same player stay in order, a player who reconnects before\n" +
++                "their save has been flushed still reads their newest data, and the queue is\n" +
++                "drained before the server stops.")
++        public boolean asyncPlayerData = true;
++    }
++
+     @Comment("Protection against malicious clients.")
+     public SecurityConfig security = new SecurityConfig();
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/io/AsyncSaveQueue.java b/src/main/java/com/voidsoul/spigot/io/AsyncSaveQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..19f3d5f78690dcc558936d485d302aea9b2cd15c
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/io/AsyncSaveQueue.java
+@@ -0,0 +1,167 @@
++package com.voidsoul.spigot.io;
++
++import net.minecraft.server.NBTCompressedStreamTools;
++import net.minecraft.server.NBTTagCompound;
++import org.bukkit.Bukkit;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.OutputStream;
++import java.util.Map;
++import java.util.concurrent.BlockingQueue;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.LinkedBlockingQueue;
++import java.util.concurrent.atomic.AtomicInteger;
++
++/**
++ * Write queue that moves NBT files off the main thread.
++ * <p>
++ * Player data is saved for every online player in a single tick on every autosave, which
++ * on a busy server means hundreds of blocking file writes back to back. Serialising the
++ * data still happens on the main thread, because reading entity state from anywhere else
++ * is not safe; only the write itself is handed over.
++ * <p>
++ * A single writer thread keeps writes for the same file in the order they were submitted,
++ * so a later save can never be overwritten by an earlier one. Data waiting in the queue is
++ * readable through {@link #peek(String)}, so a player who reconnects before their save has
++ * been flushed still gets their newest inventory rather than what is on disk.
++ */
++public final class AsyncSaveQueue {
++    private static final BlockingQueue<Job> QUEUE = new LinkedBlockingQueue<Job>();
++    private static final Map<String, NBTTagCompound> PENDING = new ConcurrentHashMap<String, NBTTagCompound>();
++    private static final AtomicInteger IN_FLIGHT = new AtomicInteger();
++    private static volatile Thread writer;
++
++    private AsyncSaveQueue() {
++    }
++
++    private static final class Job {
++        final String key;
++        final NBTTagCompound data;
++        final File target;
++
++        Job(String key, NBTTagCompound data, File target) {
++            this.key = key;
++            this.data = data;
++            this.target = target;
++        }
++    }
++
++    private static synchronized void ensureStarted() {
++        if (writer != null) {
++            return;
++        }
++
++        Thread thread = new Thread(new Runnable() {
++            @Override
++            public void run() {
++                while (true) {
++                    Job job;
++
++                    try {
++                        job = QUEUE.take();
++                    } catch (InterruptedException e) {
++                        Thread.currentThread().interrupt();
++                        return;
++                    }
++
++                    try {
++                        write(job.data, job.target);
++                    } catch (Exception e) {
++                        Bukkit.getLogger().warning("Failed to save " + job.target.getName() + ": " + e);
++                    } finally {
++                        // Only clear the pending entry if a newer save has not replaced it.
++                        PENDING.remove(job.key, job.data);
++                        IN_FLIGHT.decrementAndGet();
++                    }
++                }
++            }
++        }, "VoidSoul Save Queue");
++
++        thread.setDaemon(true);
++        thread.setPriority(Thread.NORM_PRIORITY - 1);
++        thread.start();
++        writer = thread;
++    }
++
++    /**
++     * Queues an NBT compound to be written.
++     *
++     * @param key    identifies what is being written, so a pending write can be read back
++     * @param data   the compound to write, which must not be modified after this call
++     * @param target the destination file
++     */
++    public static void submit(String key, NBTTagCompound data, File target) {
++        ensureStarted();
++        PENDING.put(key, data);
++        IN_FLIGHT.incrementAndGet();
++
++        if (!QUEUE.offer(new Job(key, data, target))) {
++            // Unbounded queue, so this should not happen; write inline rather than lose data.
++            IN_FLIGHT.decrementAndGet();
++            PENDING.remove(key, data);
++            writeOrWarn(data, target);
++        }
++    }
++
++    /**
++     * @return data that has been submitted but not written yet, or null
++     */
++    public static NBTTagCompound peek(String key) {
++        return PENDING.get(key);
++    }
++
++    /**
++     * Blocks until every queued write has finished. Called before the server stops so a
++     * shutdown can never drop data.
++     */
++    public static void flush() {
++        if (writer == null) {
++            return;
++        }
++
++        long deadline = System.currentTimeMillis() + 60000L;
++
++        while (IN_FLIGHT.get() > 0 && System.currentTimeMillis() < deadline) {
++            try {
++                Thread.sleep(5L);
++            } catch (InterruptedException e) {
++                Thread.currentThread().interrupt();
++                return;
++            }
++        }
++
++        int remaining = IN_FLIGHT.get();
++        if (remaining > 0) {
++            Bukkit.getLogger().warning("Timed out waiting for " + remaining + " queued saves to finish.");
++        }
++    }
++
++    private static void writeOrWarn(NBTTagCompound data, File target) {
++        try {
++            write(data, target);
++        } catch (Exception e) {
++            Bukkit.getLogger().warning("Failed to save " + target.getName() + ": " + e);
++        }
++    }
++
++    /** Writes to a temporary file first, then swaps it in, so a crash mid-write can't truncate the real file. */
++    private static void write(NBTTagCompound data, File target) throws Exception {
++        File temp = new File(target.getParentFile(), target.getName() + ".tmp");
++        OutputStream out = new FileOutputStream(temp);
++
++        try {
++            NBTCompressedStreamTools.a(data, out);
++        } finally {
++            out.close();
++        }
++
++        if (target.exists() && !target.delete()) {
++            throw new IllegalStateException("could not replace " + target);
++        }
++
++        if (!temp.renameTo(target)) {
++            throw new IllegalStateException("could not rename " + temp + " into place");
++        }
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 16fe00fa6faac9e2894b7b9b5a1f4b5256629bf2..9c5f1d87ab7ea9ca2725978ab908808a895b5d25 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -465,6 +465,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+             if (this.v != null) {
+                 MinecraftServer.LOGGER.info("Saving players");
+                 this.v.savePlayers();
++                com.voidsoul.spigot.io.AsyncSaveQueue.flush(); // VoidSoulSpigot - never stop with writes still queued
+                 this.v.u();
+                 try { Thread.sleep(100); } catch (InterruptedException ex) {} // CraftBukkit - SPIGOT-625 - give server at least a chance to send packets
+             }
+diff --git a/src/main/java/net/minecraft/server/WorldNBTStorage.java b/src/main/java/net/minecraft/server/WorldNBTStorage.java
+index ba13f3f20bb86f667178f51f4d3d1df63f5acf2d..73026a47595754c187fa2bdc3270f80fedbb6c0a 100644
+--- a/src/main/java/net/minecraft/server/WorldNBTStorage.java
++++ b/src/main/java/net/minecraft/server/WorldNBTStorage.java
+@@ -189,6 +189,16 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+             File file = new File(this.playerDir, entityhuman.getUniqueID().toString() + ".dat.tmp");
+             File file1 = new File(this.playerDir, entityhuman.getUniqueID().toString() + ".dat");
+ 
++            // VoidSoulSpigot start - hand the write to the save queue.
++            // An autosave writes a file for every online player in one tick, which stalls the
++            // server for as long as the disk takes. Building the compound stays here, because
++            // reading entity state off the main thread is not safe.
++            if (com.voidsoul.spigot.config.VoidSoulConfig.isAsyncPlayerDataSave()) {
++                com.voidsoul.spigot.io.AsyncSaveQueue.submit(entityhuman.getUniqueID().toString(), nbttagcompound, file1);
++                return;
++            }
++            // VoidSoulSpigot end
++
+             NBTCompressedStreamTools.a(nbttagcompound, (OutputStream) (new FileOutputStream(file)));
+             if (file1.exists()) {
+                 file1.delete();
+@@ -205,6 +215,12 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+         if (entityhuman.world.pandaSpigotConfig.disablePlayerData) return null; // PandaSpigot - Configurable player data
+         NBTTagCompound nbttagcompound = null;
+ 
++        // VoidSoulSpigot start - a save still sitting in the queue is newer than the file
++        NBTTagCompound queued = com.voidsoul.spigot.io.AsyncSaveQueue.peek(entityhuman.getUniqueID().toString());
++        if (queued != null) {
++            nbttagcompound = queued;
++        } else
++        // VoidSoulSpigot end
+         try {
+             File file = new File(this.playerDir, entityhuman.getUniqueID().toString() + ".dat");
+             // Spigot Start
+@@ -254,6 +270,12 @@ public class WorldNBTStorage implements IDataManager, IPlayerFileData {
+     // CraftBukkit start
+     public NBTTagCompound getPlayerData(String s) {
+         try {
++            // VoidSoulSpigot - a save still sitting in the queue is newer than the file
++            NBTTagCompound queued = com.voidsoul.spigot.io.AsyncSaveQueue.peek(s);
++            if (queued != null) {
++                return queued;
++            }
++
+             File file1 = new File(this.playerDir, s + ".dat");
+ 
+             if (file1.exists()) {
