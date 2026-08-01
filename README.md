@@ -52,10 +52,12 @@ competitivos como Azurite.
     - **Caña de pescar**: `rodHorizontalMultiplier`, `rodVerticalMultiplier`, `rodSpeedMultiplier`.
     - `cancelSprintOnHit`: corta el sprint de la víctima al recibir el golpe.
     - ⚠️ El knockback se configura aquí y **reemplaza** la sección `knockback` de `pandaspigot.yml`.
-- **Hit delay configurable** (`combat.hitDelayTicks`): ticks de invulnerabilidad entre golpes (vanilla `20`).
-    - `combat.hitDelayArrowTicks`: ventana propia para flechas. En 1.8, una flecha que llega dentro de la
+- **Hit delay y ritmo de golpeo** (en `knockback.yml`, editables desde `/knockback`):
+    - `hitDelayTicks`: ticks de invulnerabilidad entre golpes (vanilla `20`). Al cambiarlo desde el menú
+      se aplica también a las entidades ya vivas (cachean su ventana al aparecer).
+    - `hitDelayArrowTicks`: ventana propia para flechas. En 1.8, una flecha que llega dentro de la
       ventana normal rebota y vuelve a dañar; darle un tick más que el melé lo evita. `-1` = usa el melé.
-    - `combat.maxAttacksPerSecond`: tope de golpes melé por segundo. Pone un techo a lo que gana un
+    - `maxAttacksPerSecond`: tope de golpes melé por segundo. Pone un techo a lo que gana un
       autoclicker frente a una persona. `-1` lo desactiva. Es un límite tosco, **no** sustituye a un anticheat.
 - **Fixes de bugs de combate** (activables):
     - `combat.fixEatWhileSprinting`: evita mantener el sprint mientras se consume comida/pociones/leche

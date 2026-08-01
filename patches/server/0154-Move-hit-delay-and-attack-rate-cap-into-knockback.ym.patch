@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 31 Jul 2026 22:07:27 -0500
+Subject: [PATCH] Move hit delay and attack rate cap into knockback.yml
+
+hitDelayTicks, hitDelayArrowTicks and maxAttacksPerSecond are part of the
+same set of numbers a server owner tunes alongside knockback, so they
+belong in knockback.yml where /knockback can edit them rather than in
+voidsoul.yml. The stale entries left in voidsoul.yml are removed on
+startup along with the old knockback section.
+
+Changing hitDelayTicks now also refreshes entities that are already
+alive, since an entity caches its invulnerability window when it spawns.
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/KnockbackConfig.java b/src/main/java/com/voidsoul/spigot/config/KnockbackConfig.java
+index 7dde6018e7eb0df04c7d161f2b4e74158fd1e477..4e66866295349b3531813673116beb554349d031 100644
+--- a/src/main/java/com/voidsoul/spigot/config/KnockbackConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/KnockbackConfig.java
+@@ -59,6 +59,23 @@ public class KnockbackConfig {
+ 
+     // ---- shared ----------------------------------------------------------------
+ 
++    @Comment("How many ticks of invulnerability an entity has after being damaged.\n" +
++            "Vanilla: 20. Lower values make fights faster-paced.\n" +
++            "Plugins can still override this per-entity (maxNoDamageTicks).")
++    public int hitDelayTicks = 20;
++
++    @Comment("Separate invulnerability window for arrow hits. 1.8 lets an arrow that lands\n" +
++            "during the normal window bounce off and damage the victim a second time;\n" +
++            "giving arrows one tick more than hitDelayTicks avoids that.\n" +
++            "Negative values reuse hitDelayTicks.")
++    public int hitDelayArrowTicks = -1;
++
++    @Comment("Maximum melee attacks a player may land per second. Extra swings within the\n" +
++            "same second are ignored, which puts a ceiling on what an autoclicker gains\n" +
++            "over a human. -1 disables the cap.\n" +
++            "This is a blunt limit, not a replacement for an anticheat.")
++    public int maxAttacksPerSecond = -1;
++
+     @Comment("Stop the victim sprinting when they get hit. Applies to every model.")
+     public boolean cancelSprintOnHit = false;
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 622b81510baa3ff10377e0b8c5bfcc1fb558654b..9ba484bc107bdac268cfdf235a30480179d985ab 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -70,11 +70,12 @@ public class VoidSoulConfig {
+     }
+ 
+     /**
+-     * Removes the "knockback" section left behind in voidsoul.yml by earlier builds.
++     * Removes the settings left behind in voidsoul.yml by earlier builds after they moved
++     * to knockback.yml.
+      * <p>
+-     * Knockback now lives in its own file, and configurate keeps nodes it no longer
+-     * recognises, so without this a server would show two knockback sections with only one
+-     * of them doing anything.
++     * Configurate keeps nodes it no longer recognises, so without this a server would show
++     * the old knockback section and the old hit delay keys alongside the real ones, with
++     * only the ones in knockback.yml doing anything.
+      */
+     private static void dropMovedKnockbackSection(ConfigurationNode worldsNode) throws Exception {
+         boolean removed = false;
+@@ -84,11 +85,20 @@ public class VoidSoulConfig {
+                 worldNode.removeChild("knockback");
+                 removed = true;
+             }
++
++            ConfigurationNode combatNode = worldNode.node("combat");
++            for (String moved : new String[]{"hitDelayTicks", "hitDelayArrowTicks", "maxAttacksPerSecond"}) {
++                if (!combatNode.node(moved).virtual()) {
++                    combatNode.removeChild(moved);
++                    removed = true;
++                }
++            }
+         }
+ 
+         if (removed) {
+-            org.bukkit.Bukkit.getLogger().info("Knockback settings have moved to VoidSoul/knockback.yml; "
+-                    + "the old section in voidsoul.yml was removed. Use /knockback to edit them in game.");
++            org.bukkit.Bukkit.getLogger().info("Knockback and hit delay settings have moved to "
++                    + "VoidSoul/knockback.yml; the old entries in voidsoul.yml were removed. "
++                    + "Use /knockback to edit them in game.");
+         }
+     }
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
+index a9de7d2f74b47404c19abba3cb0df431a376f6c4..5cb06c991c9c566c70f4ddb78cfd9b76af82d5f3 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
+@@ -112,6 +112,27 @@ public final class VoidSoulKnockbackConfig {
+         if (file != null) {
+             init(file);
+             applyToWorlds();
++            applyHitDelay();
++        }
++    }
++
++    /**
++     * Pushes {@code hitDelayTicks} onto entities that are already alive.
++     * <p>
++     * An entity's invulnerability window is set when it spawns, so without this a change
++     * made in game would only take effect for entities that spawn afterwards. This does
++     * overwrite a per-entity value a plugin may have set, which is why it only runs when
++     * the setting is deliberately changed rather than every tick.
++     */
++    public static void applyHitDelay() {
++        for (World world : net.minecraft.server.MinecraftServer.getServer().worlds) {
++            int delay = get(world.worldData.getName()).hitDelayTicks;
++
++            for (Object entity : world.entityList) {
++                if (entity instanceof net.minecraft.server.EntityLiving) {
++                    ((net.minecraft.server.EntityLiving) entity).maxNoDamageTicks = delay;
++                }
++            }
+         }
+     }
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 45ca070d441ca0e5b70b74de4a9437bef903ea08..9af7348910d00c5028d102c99f1ee09e310bfded 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -11,23 +11,6 @@ public class VoidSoulWorldConfig {
+ 
+     @ConfigSerializable
+     public static class CombatConfig {
+-        @Comment("How many ticks of invulnerability an entity has after being damaged.\n" +
+-                "Vanilla: 20. Lower values make fights faster-paced.\n" +
+-                "Plugins can still override this per-entity (maxNoDamageTicks).")
+-        public int hitDelayTicks = 20;
+-
+-        @Comment("Separate invulnerability window for arrow hits. 1.8 lets an arrow that\n" +
+-                "lands during the normal window bounce off and re-damage the victim; giving\n" +
+-                "arrows one tick more than hitDelayTicks avoids that. Negative values reuse\n" +
+-                "hitDelayTicks.")
+-        public int hitDelayArrowTicks = -1;
+-
+-        @Comment("Maximum melee attacks a player may land per second. Extra swings within\n" +
+-                "the same second are ignored, which puts a ceiling on what an autoclicker\n" +
+-                "gains over a human. -1 disables the cap.\n" +
+-                "This is a blunt limit, not a replacement for an anticheat.")
+-        public int maxAttacksPerSecond = -1;
+-
+         @Comment("Prevents players from keeping sprint while consuming food, potions or\n" +
+                 "milk (the \"run and eat\" exploit). Sword blocking and bow drawing are\n" +
+                 "not affected, so block-hitting keeps working.")
+diff --git a/src/main/java/com/voidsoul/spigot/knockback/KnockbackMenu.java b/src/main/java/com/voidsoul/spigot/knockback/KnockbackMenu.java
+index 0bc567e272f6acf8b0d29d586439efb006089f68..62ea8de2bce4c0c347e5fd89979fbcb64173341a 100644
+--- a/src/main/java/com/voidsoul/spigot/knockback/KnockbackMenu.java
++++ b/src/main/java/com/voidsoul/spigot/knockback/KnockbackMenu.java
+@@ -284,6 +284,11 @@ public final class KnockbackMenu implements InventoryHolder {
+             player.sendMessage(ChatColor.RED + "Value changed, but knockback.yml could not be written.");
+         }
+ 
++        if (field.getName().equals("hitDelayTicks")) {
++            // Entities cache their invulnerability window when they spawn.
++            VoidSoulKnockbackConfig.applyHitDelay();
++        }
++
+         this.render(target);
+         player.updateInventory();
+     }
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 9845f7aeb45a4b9b67455f43f4d690597323d143..344b920eb14a6ac9f37d1531ab56f7093a079279 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -110,7 +110,7 @@ public abstract class EntityLiving extends Entity {
+         super(world);
+         // VoidSoulSpigot start - configurable hit delay
+         if (world != null && world.voidsoulConfig != null) {
+-            this.maxNoDamageTicks = world.voidsoulConfig.combat.hitDelayTicks;
++            this.maxNoDamageTicks = world.knockbackConfig.hitDelayTicks;
+         }
+         // VoidSoulSpigot end
+         this.initAttributes();
+@@ -755,7 +755,7 @@ public abstract class EntityLiving extends Entity {
+                     }
+                     this.lastDamage = f;
+                     // VoidSoulSpigot start - separate invulnerability window for arrows
+-                    int arrowDelay = this.world.voidsoulConfig.combat.hitDelayArrowTicks;
++                    int arrowDelay = this.world.knockbackConfig.hitDelayArrowTicks;
+                     this.noDamageTicks = arrowDelay >= 0 && damagesource.i() instanceof EntityArrow
+                             ? arrowDelay
+                             : this.maxNoDamageTicks;
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index 167bd4fb4835d8c99cd6caf42f7e11497d901390..5ce2d2d7b08dffa2ec4710e51b876ca2d6727767 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1421,7 +1421,7 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     }
+ 
+                     // VoidSoulSpigot start - optional cap on attacks per second
+-                    int cpsCap = this.player.world.voidsoulConfig.combat.maxAttacksPerSecond;
++                    int cpsCap = this.player.world.knockbackConfig.maxAttacksPerSecond;
+                     if (cpsCap >= 0) {
+                         if (MinecraftServer.currentTick - this.attackWindowStart >= 20) {
+                             this.attackWindowStart = MinecraftServer.currentTick;
