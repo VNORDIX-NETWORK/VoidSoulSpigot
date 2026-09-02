@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 13:05:00 -0500
+Subject: [PATCH] Reproducible region cache benchmark
+
+The audit gates the region locking work behind a production baseline, and
+a production baseline needs players. This is the part that does not.
+
+/vs bench regioncache [files] [passes] drives RegionFileCache directly
+against throwaway files in a temporary directory, so open, evict and
+reopen behaviour can be measured on any machine, before and after a
+change, with nothing else moving. It reports a cold sweep, a working-set
+sweep, and reopens per pass - which is the number that says whether the
+cache is being evicted from or emptied.
+
+It measures the cache policy, not disk throughput of real chunks: no
+chunk data is read or written, because mixing in terrain generation would
+bury the signal under run-to-run noise. It refuses to run with players
+online unless "force" is appended, since it blocks the server for
+seconds, and it closes only the handles it opened rather than calling
+RegionFileCache.a(), which would have reopened every real world's region
+files as a side effect of a benchmark.
+
+Two counters back it and are useful on their own, so /vs perf chunks now
+reports region files opened and evicted, with a note when evictions
+approach opens - the signature of more worlds in play than the 256-entry
+cache holds.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/bench/RegionCacheBenchmark.java b/src/main/java/com/voidsoul/spigot/bench/RegionCacheBenchmark.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..37475d71005995b44497c4168595935d4afc65f0
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/bench/RegionCacheBenchmark.java
+@@ -0,0 +1,188 @@
++package com.voidsoul.spigot.bench;
++
++import com.voidsoul.spigot.perf.VoidSoulProfiler;
++import net.minecraft.server.RegionFile;
++import net.minecraft.server.RegionFileCache;
++
++import java.io.File;
++import java.util.Arrays;
++import java.util.Iterator;
++import java.util.Map;
++
++/**
++ * A reproducible benchmark of the region file cache.
++ * <p>
++ * The audit gates the region locking work behind a production baseline, and a production
++ * baseline needs players. This is the part that does not: it drives {@link RegionFileCache}
++ * directly against throwaway files in a temporary directory, so the open, evict and reopen
++ * behaviour can be measured on any machine, before and after a change, with nothing else
++ * moving.
++ * <p>
++ * It measures the cache policy, not disk throughput of real chunks - no chunk data is read
++ * or written. That is the point: the policy is what changed, and mixing in terrain
++ * generation would bury the signal under noise that varies run to run.
++ * <p>
++ * Main thread only, and it blocks for as long as it runs.
++ */
++public final class RegionCacheBenchmark {
++    /** The cache's ceiling. Kept in step with RegionFileCache's own limit. */
++    private static final int CACHE_CEILING = 256;
++
++    private RegionCacheBenchmark() {
++    }
++
++    /** What one run produced. All times in milliseconds. */
++    public static final class Result {
++        public final int files;
++        public final int passes;
++        public final double coldMillis;
++        public final double workingSetMillis;
++        public final long opens;
++        public final long evictions;
++        public final double slowestOpenMillis;
++
++        Result(int files, int passes, double coldMillis, double workingSetMillis,
++               long opens, long evictions, double slowestOpenMillis) {
++            this.files = files;
++            this.passes = passes;
++            this.coldMillis = coldMillis;
++            this.workingSetMillis = workingSetMillis;
++            this.opens = opens;
++            this.evictions = evictions;
++            this.slowestOpenMillis = slowestOpenMillis;
++        }
++
++        /**
++         * Reopens per pass over the working set. Under an LRU that holds the working set,
++         * this sits near 1 - the one new file each pass touches. Under a policy that clears
++         * the whole cache it spikes to the size of the working set, because everything has
++         * to be opened again.
++         */
++        public double reopensPerPass() {
++            return this.passes == 0 ? 0.0D : (double) this.opens / this.passes;
++        }
++    }
++
++    /**
++     * Runs the benchmark.
++     *
++     * @param scratch directory to create the throwaway region files in; created if missing
++     * @param files   how many distinct region files to touch. Above the cache ceiling of
++     *                256 the eviction policy starts to matter, which is the interesting
++     *                part, so a useful figure is comfortably above it
++     * @param passes  how many times to sweep a working set that fits inside the cache
++     */
++    public static Result run(File scratch, int files, int passes) throws Exception {
++        if (!scratch.isDirectory() && !scratch.mkdirs()) {
++            throw new IllegalStateException("Could not create " + scratch);
++        }
++
++        long opensBefore = VoidSoulProfiler.regionFileOpens.total();
++        long evictionsBefore = VoidSoulProfiler.regionFileEvictions.total();
++
++        try {
++            // Phase A - cold: touch every file once, from nothing cached. Past the ceiling
++            // this is where eviction starts happening, so it prices the eviction path.
++            long[] openNanos = new long[files];
++            long coldStart = System.nanoTime();
++
++            for (int i = 0; i < files; i++) {
++                long one = System.nanoTime();
++                RegionFileCache.a(scratch, i * 32, 0, true);
++                openNanos[i] = System.nanoTime() - one;
++            }
++
++            double coldMillis = (System.nanoTime() - coldStart) / 1_000_000.0D;
++
++            // Phase B - working set: sweep a set that comfortably fits in the cache, and
++            // touch one file outside it per pass. This is the shape of a real server with
++            // more worlds than the cache holds, and it is exactly where a clear-everything
++            // policy falls over: one insert past the ceiling used to drop all 256 entries,
++            // so the next sweep reopened the entire working set.
++            int workingSet = Math.min(files, CACHE_CEILING - 8);
++            long warmStart = System.nanoTime();
++
++            for (int pass = 0; pass < passes; pass++) {
++                for (int i = 0; i < workingSet; i++) {
++                    RegionFileCache.a(scratch, i * 32, 0, true);
++                }
++
++                // One file the working set does not contain, to push against the ceiling.
++                RegionFileCache.a(scratch, (CACHE_CEILING + pass) * 32, 0, true);
++            }
++
++            double warmMillis = (System.nanoTime() - warmStart) / 1_000_000.0D;
++
++            Arrays.sort(openNanos);
++
++            return new Result(
++                    files,
++                    passes,
++                    coldMillis,
++                    warmMillis,
++                    VoidSoulProfiler.regionFileOpens.total() - opensBefore,
++                    VoidSoulProfiler.regionFileEvictions.total() - evictionsBefore,
++                    files == 0 ? 0.0D : openNanos[files - 1] / 1_000_000.0D);
++        } finally {
++            // Close only the handles this run opened, then delete the files under them.
++            // RegionFileCache.a() would have been shorter and would also have closed every
++            // real world's region files, turning a benchmark into a server-wide reopen.
++            closeUnder(scratch);
++            delete(scratch);
++        }
++    }
++
++    /**
++     * Drops this run's entries from the shared cache.
++     * <p>
++     * Taken under the same monitor {@code RegionFileCache}'s own static synchronized methods
++     * use, because the map is shared with every world and with the chunk I/O threads.
++     */
++    private static void closeUnder(File scratch) {
++        String prefix = scratch.getAbsolutePath();
++
++        synchronized (RegionFileCache.class) {
++            Iterator<Map.Entry<File, RegionFile>> iterator = RegionFileCache.a.entrySet().iterator();
++
++            while (iterator.hasNext()) {
++                Map.Entry<File, RegionFile> entry = iterator.next();
++
++                if (entry.getKey().getAbsolutePath().startsWith(prefix)) {
++                    try {
++                        entry.getValue().c();
++                    } catch (Exception ignored) {
++                        // Closing a throwaway file; nothing here is worth failing the run.
++                    }
++
++                    iterator.remove();
++                }
++            }
++        }
++    }
++
++    /**
++     * Reopens counted during phase B only, which is the number the cache policy actually
++     * decides. Phase A's opens are unavoidable - the files did not exist yet.
++     */
++    public static long workingSetOpens(Result result) {
++        return Math.max(0L, result.opens - result.files);
++    }
++
++    private static void delete(File directory) {
++        File[] children = directory.listFiles();
++
++        if (children != null) {
++            for (File child : children) {
++                if (child.isDirectory()) {
++                    delete(child);
++                } else if (!child.delete()) {
++                    child.deleteOnExit();
++                }
++            }
++        }
++
++        if (!directory.delete()) {
++            directory.deleteOnExit();
++        }
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index 33a6ff806753a6819dce0d94e098ae1c57e701a6..4e0b3d44238cc2fa10b3f1d0bc08aa9b25834d2d 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -1,11 +1,13 @@
+ package com.voidsoul.spigot.perf;
+ 
++import com.voidsoul.spigot.bench.RegionCacheBenchmark;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.WorldServer;
+ import org.bukkit.ChatColor;
+ import org.bukkit.command.Command;
+ import org.bukkit.command.CommandSender;
+ 
++import java.io.File;
+ import java.util.ArrayList;
+ import java.util.Arrays;
+ import java.util.Collections;
+@@ -29,7 +31,7 @@ public final class PerfCommand extends Command {
+     private PerfCommand() {
+         super("vs");
+         this.description = "VoidSoulSpigot performance information";
+-        this.usageMessage = "/vs perf [chunks|worlds|packets|entities|trace|reset]";
++        this.usageMessage = "/vs perf [chunks|worlds|packets|entities|trace|reset] | /vs bench regioncache";
+         this.setPermission(PERMISSION);
+         this.setAliases(Arrays.asList("voidsoul"));
+     }
+@@ -45,6 +47,12 @@ public final class PerfCommand extends Command {
+             return true;
+         }
+ 
++        // VoidSoulSpigot start - reproducible benchmarks
++        if (args.length > 0 && args[0].equalsIgnoreCase("bench")) {
++            return this.bench(sender, args);
++        }
++        // VoidSoulSpigot end
++
+         if (args.length == 0 || !args[0].equalsIgnoreCase("perf")) {
+             sender.sendMessage(ChatColor.RED + "Usage: " + this.usageMessage);
+             return true;
+@@ -77,8 +85,14 @@ public final class PerfCommand extends Command {
+     @Override
+     public List<String> tabComplete(CommandSender sender, String alias, String[] args) {
+         if (args.length == 1) {
+-            return partial(args[0], Collections.singletonList("perf"));
++            return partial(args[0], Arrays.asList("perf", "bench")); // VoidSoulSpigot - benchmarks
++        }
++
++        // VoidSoulSpigot start - benchmarks
++        if (args.length == 2 && args[0].equalsIgnoreCase("bench")) {
++            return partial(args[1], Collections.singletonList("regioncache"));
+         }
++        // VoidSoulSpigot end
+ 
+         if (args.length == 2 && args[0].equalsIgnoreCase("perf")) {
+             return partial(args[1], Arrays.asList("chunks", "worlds", "packets", "entities", "trace", "reset"));
+@@ -192,6 +206,19 @@ public final class PerfCommand extends Command {
+     private void chunks(CommandSender sender) {
+         header(sender, "Chunks, last " + windowSeconds() + "s");
+ 
++        // VoidSoulSpigot start - the region cache is one static map shared by every world,
++        // so it is reported once rather than per world.
++        long regionOpens = VoidSoulProfiler.regionFileOpens.window(WINDOW);
++        long regionEvictions = VoidSoulProfiler.regionFileEvictions.window(WINDOW);
++
++        if ((regionOpens | regionEvictions) != 0L) {
++            line(sender, "Region files", regionOpens + "" + LABEL + " opened, " + VALUE
++                    + regionEvictions + LABEL + " evicted"
++                    + (regionEvictions > regionOpens / 2L && regionOpens > 20L
++                    ? ChatColor.YELLOW + "  (more worlds in play than the cache holds)" : ""));
++        }
++        // VoidSoulSpigot end
++
+         List<WorldServer> worlds = sortedWorlds(new Comparator<WorldServer>() {
+             @Override
+             public int compare(WorldServer a, WorldServer b) {
+@@ -328,6 +355,72 @@ public final class PerfCommand extends Command {
+         footer(sender);
+     }
+ 
++    // VoidSoulSpigot start - reproducible benchmarks
++    /** {@code /vs bench regioncache [files] [passes] [force]} */
++    private boolean bench(CommandSender sender, String[] args) {
++        if (args.length < 2 || !args[1].equalsIgnoreCase("regioncache")) {
++            sender.sendMessage(ChatColor.RED + "Usage: /vs bench regioncache [files] [passes]");
++            sender.sendMessage(LABEL + "Drives the region file cache against throwaway files so "
++                    + "its open and evict behaviour can be compared across builds. It blocks "
++                    + "the server while it runs.");
++            return true;
++        }
++
++        int files = parse(args, 2, 1024, 8, 20000);
++        int passes = parse(args, 3, 40, 1, 2000);
++        boolean force = args.length > 4 && args[4].equalsIgnoreCase("force");
++        int online = MinecraftServer.getServer().getPlayerList().getPlayerCount();
++
++        if (online > 0 && !force) {
++            sender.sendMessage(ChatColor.RED + "There are " + online + " players online and this "
++                    + "freezes the server for seconds. Run it on an empty server, or append "
++                    + ChatColor.WHITE + "force" + ChatColor.RED + " if you mean it.");
++            return true;
++        }
++
++        File scratch = new File(MinecraftServer.getServer().server.getWorldContainer(), "voidsoul-bench");
++
++        sender.sendMessage(LABEL + "Running: " + files + " region files, " + passes + " passes...");
++
++        RegionCacheBenchmark.Result result;
++
++        try {
++            result = RegionCacheBenchmark.run(scratch, files, passes);
++        } catch (Throwable throwable) {
++            sender.sendMessage(ChatColor.RED + "Benchmark failed: " + throwable);
++            MinecraftServer.LOGGER.warn("VoidSoul region cache benchmark failed", throwable);
++            return true;
++        }
++
++        header(sender, "Region cache benchmark");
++        line(sender, "Files", result.files + "" + LABEL + " distinct, cache ceiling 256");
++        line(sender, "Cold sweep", String.format("%.1f ms", result.coldMillis) + LABEL
++                + "  slowest single open " + VALUE + String.format("%.2f ms", result.slowestOpenMillis));
++        line(sender, "Working set", String.format("%.1f ms over %d passes",
++                result.workingSetMillis, result.passes));
++        line(sender, "Opens", result.opens + "" + LABEL + "  evictions " + VALUE + result.evictions);
++        line(sender, "Reopens/pass", String.format("%.1f",
++                (double) RegionCacheBenchmark.workingSetOpens(result) / Math.max(1, result.passes)));
++        sender.sendMessage(LABEL + "Reopens per pass near 1 means the working set stayed cached. "
++                + "A figure near the working set size means the cache is being emptied rather "
++                + "than evicted from.");
++        footer(sender);
++        return true;
++    }
++
++    private static int parse(String[] args, int index, int fallback, int min, int max) {
++        if (args.length <= index) {
++            return fallback;
++        }
++
++        try {
++            return Math.max(min, Math.min(max, Integer.parseInt(args[index])));
++        } catch (NumberFormatException e) {
++            return fallback;
++        }
++    }
++    // VoidSoulSpigot end
++
+     private void trace(CommandSender sender, String argument) {
+         if (argument.equals("on") || argument.equals("off")) {
+             boolean on = argument.equals("on");
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index 98559ef22a529a53a68af3ecfafe3fbe52ddc711..a3e04d438dc9e021e6f3ea0b698ed8a9df5be5ac 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -76,6 +76,16 @@ public final class VoidSoulProfiler {
+     /** Time spent in the periodic world save. */
+     public static final RollingCounter saveNanos = counter();
+ 
++    // --- region files -------------------------------------------------------------------
++    // Global rather than per world, because RegionFileCache is a single static map shared
++    // by every world - which is itself the reason these numbers are worth watching.
++
++    /** Region files opened, each one a file handle and a header read. */
++    public static final RollingCounter regionFileOpens = counter();
++
++    /** Region files closed to make room for another. */
++    public static final RollingCounter regionFileEvictions = counter();
++
+     // --- network ------------------------------------------------------------------------
+     // Written from Netty event loop threads.
+ 
+diff --git a/src/main/java/net/minecraft/server/RegionFileCache.java b/src/main/java/net/minecraft/server/RegionFileCache.java
+index a16b0adbea487f5253ee094789aac0b6c88f48f4..9dc943ea934e2e47c108decaa243bf5f40febb04 100644
+--- a/src/main/java/net/minecraft/server/RegionFileCache.java
++++ b/src/main/java/net/minecraft/server/RegionFileCache.java
+@@ -37,6 +37,7 @@ public class RegionFileCache {
+ 
+                 if (evicted != null) {
+                     evicted.c();
++                    com.voidsoul.spigot.perf.VoidSoulProfiler.regionFileEvictions.increment();
+                 }
+             } catch (IOException ioexception) {
+                 ioexception.printStackTrace();
+@@ -68,6 +69,7 @@ public class RegionFileCache {
+ 
+             // VoidSoulSpigot - the "close everything at 256" block that used to sit here is
+             // gone; the map evicts its least recently used entry on insert instead.
++            com.voidsoul.spigot.perf.VoidSoulProfiler.regionFileOpens.increment(); // VoidSoulSpigot
+             RegionFile regionfile1 = new RegionFile(file2);
+ 
+             RegionFileCache.a.put(file2, regionfile1);

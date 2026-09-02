@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 13:14:27 -0500
+Subject: [PATCH] Adaptive performance
+
+Gives up non-critical work while the server is behind, and takes it back
+when it catches up.
+
+  adaptive.enabled              off by default
+  adaptive.engageMspt           45 ms p95 engages
+  adaptive.recoverMspt          30 ms p95 stands down
+  adaptive.recoveryDelayTicks   how long good ticks must hold
+  adaptive.actions.*            what may be given up
+
+Two actions, both reversible and both about chunks: the per-player chunk
+send byte budget is scaled down, so chunks still arrive but more slowly,
+and the directional weighting of the chunk queue falls back to the plain
+integer distance sort.
+
+There is a hard rule about what may be given up, and it is enforced by
+what the class exposes rather than by discipline: combat, hit detection,
+knockback, movement and reach have no switch here. A server that quietly
+changes how PvP feels whenever it gets busy is worse than one that drops
+a few TPS, because players feel the first immediately and cannot tell you
+why.
+
+It triggers on p95 rather than the average, because a server that is fine
+except for one 300 ms spike a minute has a healthy-looking average and
+the spike is the part players felt. Engaging is immediate, standing down
+waits out recoveryDelayTicks, and the two thresholds are deliberately
+apart - one threshold makes the server flap across the boundary, and each
+crossing costs more than the degraded mode saves. It logs both
+transitions by default, because a server that silently changes its own
+behaviour is hard to debug afterwards.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/adaptive/AdaptivePerformance.java b/src/main/java/com/voidsoul/spigot/adaptive/AdaptivePerformance.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3e2372e28c98be48c89ca1f1fa377e199ce6c032
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/adaptive/AdaptivePerformance.java
+@@ -0,0 +1,121 @@
++package com.voidsoul.spigot.adaptive;
++
++import com.voidsoul.spigot.config.VoidSoulConfig;
++import com.voidsoul.spigot.perf.VoidSoulProfiler;
++import net.minecraft.server.MinecraftServer;
++import org.bukkit.Bukkit;
++
++/**
++ * Gives up non-critical work while the server is behind, and takes it back when it catches
++ * up.
++ * <p>
++ * There is a hard rule about what may be given up, and it is enforced by what this class
++ * exposes rather than by discipline: combat, hit detection, knockback, movement and reach
++ * have no switch here and never will. A server that quietly changes how PvP feels whenever
++ * it gets busy is worse than a server that drops a few TPS, because players feel the first
++ * one immediately and cannot tell you why.
++ * <p>
++ * Engaging is quick and standing down is slow, for the same reason the view distance system
++ * works that way: a single threshold makes the server flap across the boundary, and each
++ * crossing costs more than the degraded mode saves.
++ * <p>
++ * Main thread only.
++ */
++public final class AdaptivePerformance {
++    private static boolean degraded;
++    private static int recovering;
++
++    private AdaptivePerformance() {
++    }
++
++    /** Whether the server is currently giving up non-critical work. */
++    public static boolean isDegraded() {
++        return degraded;
++    }
++
++    /**
++     * Factor to apply to a chunk send byte budget. 1.0 when running normally, so callers can
++     * multiply unconditionally.
++     */
++    public static double chunkSendBudgetScale() {
++        if (!degraded) {
++            return 1.0D;
++        }
++
++        double scale = VoidSoulConfig.getAdaptive().actions.chunkSendBudgetScale;
++
++        // A scale of zero would stall every player's chunk queue outright rather than slow
++        // it, so the floor keeps chunks flowing however aggressively this is configured.
++        return Math.max(0.05D, Math.min(1.0D, scale));
++    }
++
++    /** Whether the chunk queue should fall back to its plain distance sort. */
++    public static boolean suspendDirectionalChunkOrder() {
++        return degraded && VoidSoulConfig.getAdaptive().actions.suspendDirectionalChunkOrder;
++    }
++
++    /** Called every tick from the server tick; does its real work on the check interval. */
++    public static void tick() {
++        VoidSoulConfig.AdaptiveConfig config = VoidSoulConfig.getAdaptive();
++
++        if (!config.enabled) {
++            if (degraded) {
++                standDown(config, "adaptive performance was switched off");
++            }
++
++            return;
++        }
++
++        int interval = Math.max(1, config.checkIntervalTicks);
++
++        if (MinecraftServer.currentTick % interval != 0) {
++            return;
++        }
++
++        // p95 rather than the average: a server that is fine except for one 300 ms spike a
++        // minute has an average that looks healthy, and the spike is the thing players felt.
++        VoidSoulProfiler.TickStats stats = VoidSoulProfiler.tickStats(
++                Math.max(1, interval / 20));
++
++        if (stats.samples == 0) {
++            return;
++        }
++
++        if (!degraded) {
++            if (stats.percentile95 >= config.engageMspt) {
++                degraded = true;
++                recovering = 0;
++
++                if (config.actions.log) {
++                    Bukkit.getLogger().info(String.format(
++                            "[VoidSoul] Adaptive performance engaged: p95 tick time %.1f ms is at "
++                                    + "or above the %.1f ms threshold. Chunk sending slows down; "
++                                    + "combat is untouched.",
++                            stats.percentile95, config.engageMspt));
++                }
++            }
++
++            return;
++        }
++
++        if (stats.percentile95 > config.recoverMspt) {
++            recovering = 0;
++            return;
++        }
++
++        recovering += interval;
++
++        if (recovering >= Math.max(0, config.recoveryDelayTicks)) {
++            standDown(config, String.format("p95 tick time held at %.1f ms", stats.percentile95));
++        }
++    }
++
++    private static void standDown(VoidSoulConfig.AdaptiveConfig config, String reason) {
++        degraded = false;
++        recovering = 0;
++
++        if (config.actions != null && config.actions.log) {
++            Bukkit.getLogger().info("[VoidSoul] Adaptive performance stood down: " + reason + ".");
++        }
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index d5db008bb038c67b4d32933a200eac15cef32320..7bc402fec0133c63d0ead12ebe31da1f27ac7182 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -345,6 +345,64 @@ public class VoidSoulConfig {
+         public int serviceId = 0;
+     }
+ 
++    /** @return the adaptive settings. Safe to call before the config is loaded. */
++    public static AdaptiveConfig getAdaptive() {
++        return config == null || config.adaptive == null ? DISABLED_ADAPTIVE : config.adaptive;
++    }
++
++    private static final AdaptiveConfig DISABLED_ADAPTIVE = new AdaptiveConfig();
++
++    @Comment("Back off non-critical work automatically while the server is struggling.")
++    public AdaptiveConfig adaptive = new AdaptiveConfig();
++
++    @ConfigSerializable
++    public static class AdaptiveConfig {
++        @Comment("Off by default. A server that reacts to its own load is harder to reason\n" +
++                "about than one that does not, so turn this on once you know from /vs perf\n" +
++                "what your spikes actually are - not before.")
++        public boolean enabled = false;
++
++        @Comment("Engage once the 95th percentile tick time over the last check window goes\n" +
++                "above this many milliseconds. 50 ms is a full tick, so anything at or above\n" +
++                "that means the server is already behind.")
++        public double engageMspt = 45.0;
++
++        @Comment("Stand down once p95 tick time drops back below this. Deliberately lower\n" +
++                "than engageMspt: a single threshold makes the server flap in and out of\n" +
++                "degraded mode around the boundary, which costs more than it saves.")
++        public double recoverMspt = 30.0;
++
++        @Comment("How often the tick times are checked, in ticks.")
++        public int checkIntervalTicks = 100;
++
++        @Comment("How long tick times must stay under recoverMspt before standing down.")
++        public int recoveryDelayTicks = 600;
++
++        @Comment("What is allowed to be given up while degraded.\n" +
++                "\n" +
++                "Note what is not here, and cannot be: combat, hit detection, knockback,\n" +
++                "movement and reach are never touched. A server that quietly changes how PvP\n" +
++                "feels whenever it is busy is worse than a server that drops a few TPS, and\n" +
++                "players notice the first one immediately.")
++        public ActionsConfig actions = new ActionsConfig();
++
++        @ConfigSerializable
++        public static class ActionsConfig {
++            @Comment("Multiply the per-player chunk send byte budget by this while degraded.\n" +
++                    "Chunks still arrive, just more slowly. 1.0 disables this action.")
++            public double chunkSendBudgetScale = 0.5;
++
++            @Comment("Drop the directional weighting of the chunk queue while degraded,\n" +
++                    "falling back to the plain integer distance sort. Costs a little ordering\n" +
++                    "quality and saves a square root per comparison on join and teleport.")
++            public boolean suspendDirectionalChunkOrder = true;
++
++            @Comment("Log a line when degraded mode engages and stands down. Worth leaving on:\n" +
++                    "a server silently changing its own behaviour is hard to debug later.")
++            public boolean log = true;
++        }
++    }
++
+     @Comment("Built-in performance measurement, read with /vs perf.")
+     public DebugConfig debug = new DebugConfig();
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 2e0ae5915bcf5db2a2529449ff53864d7ce74ee3..2c2967ecc8cb3ee2d768a2c4a9b55c36f380c81e 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -253,7 +253,9 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+             // VoidSoulSpigot start - chunk send budget
+             com.voidsoul.spigot.config.VoidSoulWorldConfig.ChunksConfig.SendConfig sendConfig = this.world.voidsoulConfig.chunks.send;
+             int maxChunks = sendConfig.maxChunksPerTick > 0 ? sendConfig.maxChunksPerTick : this.world.spigotConfig.maxBulkChunk;
+-            int byteBudget = sendConfig.maxBytesPerTick;
++            // VoidSoulSpigot - while the server is behind, chunks still arrive, just slower.
++            int byteBudget = (int) (sendConfig.maxBytesPerTick
++                    * com.voidsoul.spigot.adaptive.AdaptivePerformance.chunkSendBudgetScale());
+             // VoidSoulSpigot end
+ 
+             while (iterator1.hasNext() && arraylist.size() < maxChunks) { // Spigot // VoidSoulSpigot - configurable chunk limit
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 97fa0e276b15b0605bd592d68aa259a9dbc73d33..df3b009578972b18a28ccf5c0a97551fb4d6d825 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -756,6 +756,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+         ++this.ticks;
+         com.voidsoul.spigot.chunk.ChunkSendBudget.startTick(); // VoidSoulSpigot - chunk send budget
+         com.voidsoul.spigot.chunk.SmartViewDistance.tick(this); // VoidSoulSpigot - smart view distance
++        com.voidsoul.spigot.adaptive.AdaptivePerformance.tick(); // VoidSoulSpigot - adaptive performance
+         if (this.T) {
+             this.T = false;
+             this.methodProfiler.a = true;
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index aadafb38bf24a864f74b3fc75e632c1cafba65d2..fd09eb6f58cdde1a33efa883d16587eb2bde465b 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -642,7 +642,10 @@ public class PlayerChunkMap {
+             x = (int) entityplayer.locX >> 4;
+             z = (int) entityplayer.locZ >> 4;
+ 
+-            double configured = entityplayer.world.voidsoulConfig.chunks.send.directionalBias;
++            // VoidSoulSpigot - adaptive performance drops the weighting while the server is
++            // behind, falling back to the plain integer distance sort.
++            double configured = com.voidsoul.spigot.adaptive.AdaptivePerformance.suspendDirectionalChunkOrder()
++                    ? 0.0D : entityplayer.world.voidsoulConfig.chunks.send.directionalBias;
+             double dx = chunkDeltaX;
+             double dz = chunkDeltaZ;
+ 
