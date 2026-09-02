@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 08:48:24 -0500
+Subject: [PATCH] Turn chunk retention on by default, and bound it
+
+unloadDelayTicks was added in an earlier patch and defaulted to 0, so the
+feature that stops a prison server reloading the same mine off the disk
+every time a player walks out of it was shipped switched off.
+
+It now defaults to 400 ticks (20 seconds), and gains a companion limit:
+over unloadDelayChunkLimit loaded chunks the delay is dropped for that
+pass, so a world under pressure unloads exactly as it would have without
+retention and memory can never run away because of it.
+
+Whether the delay is worth its memory is now answerable rather than a
+guess - /vs perf chunks reports retains next to unloads, and the share of
+chunk queue entries that never reached the disk.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 9af7348910d00c5028d102c99f1ee09e310bfded..5f72825d592181c344a098ab811c36756f99362d 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -80,8 +80,24 @@ public class VoidSoulWorldConfig {
+                 "the delay is simply taken out of the queue, with no disk I/O at all.\n" +
+                 "0 keeps the vanilla behaviour of unloading as soon as possible.\n" +
+                 "Reasonable values are 200-600 (10-30 seconds); higher values keep more\n" +
+-                "chunks in memory.")
+-        public int unloadDelayTicks = 0;
++                "chunks in memory.\n" +
++                "\n" +
++                "The cost is not only memory. A chunk waiting out its delay has not had\n" +
++                "removeEntities() called on it yet, so its entities are still in the world\n" +
++                "and still tick, subject to the activation range. Watch \"retained\" in\n" +
++                "/vs perf chunks: if it is not a large share of the unloads, the delay is\n" +
++                "only costing you.")
++        public int unloadDelayTicks = 400;
++
++        @Comment("Ignore unloadDelayTicks once a world has more than this many chunks\n" +
++                "loaded, so retention can never be the reason a server runs out of memory.\n" +
++                "\n" +
++                "Over the limit, chunks unload as soon as they are queued, exactly as they\n" +
++                "would with the delay off; under it, the delay applies again. A view distance\n" +
++                "of 10 keeps roughly 441 chunks per player in view, so a limit wants to be\n" +
++                "comfortably above what your player count actually needs.\n" +
++                "0 means no limit.")
++        public int unloadDelayChunkLimit = 0;
+ 
+         @Comment("Maximum number of sky light columns re-checked per chunk per tick.\n" +
+                 "\n" +
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index b8c66cc68b946786ddbd83296684df6c0967b826..c1906da3f78be9104d7993bca0c6d7eff61f5976 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -407,7 +407,17 @@ public class ChunkProviderServer implements IChunkProvider {
+             int maxUnloads = this.world.voidsoulConfig.chunks.maxUnloadsPerTick;
+             if (maxUnloads <= 0) maxUnloads = Integer.MAX_VALUE;
+ 
+-            final int unloadDelay = this.world.voidsoulConfig.chunks.unloadDelayTicks;
++            int unloadDelay = this.world.voidsoulConfig.chunks.unloadDelayTicks;
++
++            // VoidSoulSpigot start - keep retention from being the reason we run out of
++            // memory: over the configured chunk limit the delay is simply dropped, so this
++            // world unloads exactly as it would have without it.
++            final int unloadDelayChunkLimit = this.world.voidsoulConfig.chunks.unloadDelayChunkLimit;
++
++            if (unloadDelayChunkLimit > 0 && this.chunks.size() > unloadDelayChunkLimit) {
++                unloadDelay = 0;
++            }
++            // VoidSoulSpigot end
+             // Chunks whose delay hasn't elapsed yet. They are put back once the loop is
+             // done, so they can't be popped again during this same pass.
+             final java.util.List<Long> deferred = unloadDelay > 0 ? new java.util.ArrayList<Long>() : null;

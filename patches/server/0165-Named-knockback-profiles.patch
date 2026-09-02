@@ -1,0 +1,372 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 09:43:04 -0500
+Subject: [PATCH] Named knockback profiles
+
+The fork has three knockback models and around forty tunable values, and
+no way to reach a sensible starting point for a given style of server
+short of typing all of them.
+
+/knockback profile lists what is available; /knockback profile <name>
+[world|default] applies one:
+
+  DEFAULT   vanilla 1.8, untouched - the way back to a clean slate
+  HCF       grounded, with the 1.7 chase reduction on so a chase can
+            actually be closed
+  PRACTICE  CONSTANT model, so every hit sends the victim the same
+            distance and combos are repeatable
+  POT       more vertical and air time, rods and pearls carry the fight
+  OP        short knockback with combo hold, for heavily geared fights
+
+A profile is applied once and written to knockback.yml like any
+hand-typed value - a starting point, not a mode the server keeps
+enforcing. That matters because the in-game editor writes to the same
+file, and a profile that re-asserted itself would silently undo whatever
+was tuned afterwards.
+
+Applying one builds a fresh KnockbackConfig rather than editing in
+place, so it is a genuine clean slate for that world, and the command
+says so when it confirms. "default" targets the section every world
+without its own entry falls back to.
+
+These numbers are opinionated, not measured: recognisable starting
+points built from knobs this fork already has, not reproductions of any
+particular network's feel. The class javadoc says so rather than
+implying otherwise.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
+index 5cb06c991c9c566c70f4ddb78cfd9b76af82d5f3..d9392954f083fd432a76d872d0c10e9cd143eb5e 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulKnockbackConfig.java
+@@ -146,6 +146,26 @@ public final class VoidSoulKnockbackConfig {
+         }
+     }
+ 
++    // VoidSoulSpigot start - named profiles
++    /**
++     * Replaces a world's knockback outright, as {@code /knockback profile} does.
++     * <p>
++     * "default" targets the section every world without its own entry falls back to, so
++     * applying a profile there moves the whole server.
++     *
++     * @param worldName the world, or "default"
++     * @param config    the replacement, normally from {@link
++     *                  com.voidsoul.spigot.knockback.KnockbackProfiles#build()}
++     */
++    public static void setWorldConfig(String worldName, KnockbackConfig config) {
++        if ("default".equals(worldName)) {
++            defaultWorldConfig = config;
++        } else {
++            worldConfigs.put(worldName, config);
++        }
++    }
++    // VoidSoulSpigot end
++
+     public static KnockbackConfig get(String worldName) {
+         KnockbackConfig config = worldConfigs.get(worldName);
+         return config != null ? config : defaultWorldConfig;
+diff --git a/src/main/java/com/voidsoul/spigot/knockback/KnockbackCommand.java b/src/main/java/com/voidsoul/spigot/knockback/KnockbackCommand.java
+index dcec3780eb9af4c90fb02fcb1d8b6c090ee2610e..19d56d2e4ded2b8195d5c900fcb9ab40dc133976 100644
+--- a/src/main/java/com/voidsoul/spigot/knockback/KnockbackCommand.java
++++ b/src/main/java/com/voidsoul/spigot/knockback/KnockbackCommand.java
+@@ -23,7 +23,7 @@ public final class KnockbackCommand extends Command {
+     private KnockbackCommand() {
+         super("knockback");
+         this.description = "Edit this world's knockback settings";
+-        this.usageMessage = "/knockback [world|reload]";
++        this.usageMessage = "/knockback [world|reload|profile]";
+         this.setPermission(PERMISSION);
+         this.setAliases(Arrays.asList("kb", "voidsoulkb"));
+     }
+@@ -45,6 +45,12 @@ public final class KnockbackCommand extends Command {
+             return true;
+         }
+ 
++        // VoidSoulSpigot start - named profiles
++        if (args.length > 0 && args[0].equalsIgnoreCase("profile")) {
++            return this.profile(sender, args);
++        }
++        // VoidSoulSpigot end
++
+         if (!(sender instanceof Player)) {
+             sender.sendMessage(ChatColor.RED + "The knockback editor can only be opened in game. "
+                     + "Use /knockback reload from the console after editing the file by hand.");
+@@ -71,28 +77,128 @@ public final class KnockbackCommand extends Command {
+         return true;
+     }
+ 
++    // VoidSoulSpigot start - named profiles
++    /** {@code /knockback profile [name] [world]} */
++    private boolean profile(CommandSender sender, String[] args) {
++        if (args.length < 2) {
++            sender.sendMessage(ChatColor.AQUA + "Knockback profiles");
++
++            for (KnockbackProfiles profile : KnockbackProfiles.values()) {
++                sender.sendMessage(ChatColor.WHITE + "  " + profile.name() + ChatColor.GRAY
++                        + " - " + profile.summary());
++            }
++
++            sender.sendMessage(ChatColor.DARK_GRAY + "/knockback profile <name> [world|default]");
++            sender.sendMessage(ChatColor.GRAY + "Applying one replaces that world's settings "
++                    + "and writes them to knockback.yml. Tune from there with /knockback.");
++            return true;
++        }
++
++        KnockbackProfiles profile = KnockbackProfiles.byName(args[1]);
++
++        if (profile == null) {
++            sender.sendMessage(ChatColor.RED + "No profile called " + args[1]
++                    + ". Run /knockback profile to list them.");
++            return true;
++        }
++
++        String worldName;
++
++        if (args.length > 2) {
++            if (args[2].equalsIgnoreCase("default")) {
++                worldName = "default";
++            } else {
++                World world = Bukkit.getWorld(args[2]);
++
++                if (world == null) {
++                    sender.sendMessage(ChatColor.RED + "No world named " + args[2] + ".");
++                    return true;
++                }
++
++                worldName = world.getName();
++            }
++        } else if (sender instanceof Player) {
++            worldName = ((Player) sender).getWorld().getName();
++        } else {
++            sender.sendMessage(ChatColor.RED + "From the console, name the world: "
++                    + "/knockback profile " + profile.name() + " <world|default>");
++            return true;
++        }
++
++        VoidSoulKnockbackConfig.setWorldConfig(worldName, profile.build());
++        VoidSoulKnockbackConfig.applyToWorlds();
++        VoidSoulKnockbackConfig.applyHitDelay();
++
++        if (VoidSoulKnockbackConfig.save()) {
++            sender.sendMessage(ChatColor.GREEN + "Applied " + profile.name() + " to "
++                    + worldName + ChatColor.GRAY + " - previous settings for that world were "
++                    + "replaced. Edit with /knockback.");
++        } else {
++            sender.sendMessage(ChatColor.YELLOW + "Applied " + profile.name() + " to "
++                    + worldName + ", but knockback.yml could not be written. The change will "
++                    + "be lost on restart; check the console.");
++        }
++
++        return true;
++    }
++    // VoidSoulSpigot end
++
+     @Override
+     public List<String> tabComplete(CommandSender sender, String alias, String[] args) {
++        // VoidSoulSpigot start - named profiles
++        if (args.length == 2 && args[0].equalsIgnoreCase("profile")) {
++            return match(args[1], profileNames());
++        }
++
++        if (args.length == 3 && args[0].equalsIgnoreCase("profile")) {
++            List<String> worlds = new ArrayList<String>();
++            worlds.add("default");
++
++            for (World world : Bukkit.getWorlds()) {
++                worlds.add(world.getName());
++            }
++
++            return match(args[2], worlds);
++        }
++        // VoidSoulSpigot end
++
+         if (args.length != 1) {
+             return Collections.emptyList();
+         }
+ 
+         List<String> options = new ArrayList<String>();
+         options.add("reload");
++        options.add("profile"); // VoidSoulSpigot - named profiles
+ 
+         for (World world : Bukkit.getWorlds()) {
+             options.add(world.getName());
+         }
+ 
+-        String prefix = args[0].toLowerCase();
++        return match(args[0], options); // VoidSoulSpigot - shared with the profile completions
++    }
++
++    // VoidSoulSpigot start - named profiles
++    private static List<String> profileNames() {
++        List<String> names = new ArrayList<String>();
++
++        for (KnockbackProfiles profile : KnockbackProfiles.values()) {
++            names.add(profile.name());
++        }
++
++        return names;
++    }
++
++    private static List<String> match(String prefix, List<String> options) {
++        String lower = prefix.toLowerCase();
+         List<String> matches = new ArrayList<String>();
+ 
+         for (String option : options) {
+-            if (option.toLowerCase().startsWith(prefix)) {
++            if (option.toLowerCase().startsWith(lower)) {
+                 matches.add(option);
+             }
+         }
+ 
+         return matches;
+     }
++    // VoidSoulSpigot end
+ }
+diff --git a/src/main/java/com/voidsoul/spigot/knockback/KnockbackProfiles.java b/src/main/java/com/voidsoul/spigot/knockback/KnockbackProfiles.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..c048f94fbbc3d9959cd551dd2d2d0c38c20b564f
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/knockback/KnockbackProfiles.java
+@@ -0,0 +1,140 @@
++package com.voidsoul.spigot.knockback;
++
++import com.voidsoul.spigot.config.KnockbackConfig;
++
++/**
++ * Named starting points for a world's knockback.
++ * <p>
++ * A profile is applied once and then written to knockback.yml like any hand-typed value, so
++ * it is a starting point you tune from, not a mode the server keeps enforcing. That is
++ * deliberate: the in-game editor writes to the same file, and a profile that re-asserted
++ * itself would silently undo whatever was tuned afterwards.
++ * <p>
++ * These numbers are opinionated, not measured. They are built out of the knobs this fork
++ * already has, and they are chosen to be recognisable starting points for each style of
++ * server - not reproductions of any particular network's feel. Expect to tune them.
++ */
++public enum KnockbackProfiles {
++
++    /** Vanilla 1.8, untouched. Applying this is how you get back to a clean slate. */
++    DEFAULT("Vanilla 1.8 knockback, exactly as Mojang shipped it.") {
++        @Override
++        void configure(KnockbackConfig config) {
++            // Every field already defaults to vanilla, so there is nothing to change.
++        }
++    },
++
++    /**
++     * Grounded fights where running someone down has to be possible. The 1.7 chase
++     * reduction is the point of this profile.
++     */
++    HCF("Grounded fights, and chasing works. Lower launch, 1.7-style chase reduction.") {
++        @Override
++        void configure(KnockbackConfig config) {
++            config.type = KnockbackConfig.Type.SIMPLE;
++            config.friction = 2.0D;
++            config.horizontal = 0.36D;
++            config.vertical = 0.36D;
++            config.verticalLimit = 0.36D;
++            config.extraHorizontal = 0.45D;
++            config.extraVertical = 0.08D;
++
++            // Without this, every hit on a fleeing player punts them further ahead and a
++            // chase can never be closed.
++            config.enableOnePointSeven = true;
++            config.onePointSevenMultiplier = 0.4D;
++        }
++    },
++
++    /**
++     * Every hit sends the victim the same distance regardless of what they were doing,
++     * which is what makes combos learnable and duels repeatable.
++     */
++    PRACTICE("Identical knockback on every hit, so combos are repeatable.") {
++        @Override
++        void configure(KnockbackConfig config) {
++            config.type = KnockbackConfig.Type.CONSTANT;
++            config.constant.horizontal = 0.527375D;
++            config.constant.vertical = 0.361375D;
++            config.constant.verticalLongAir = 0.1D;
++            config.constant.horizontalSprintReset = 0.8545D;
++            config.constant.yawModifier = 0.0D;
++            config.cancelSprintOnHit = false;
++        }
++    },
++
++    /** More air time, so healing under pressure is harder and rods matter. */
++    POT("More vertical and more air time. Rods and pearls carry the fight.") {
++        @Override
++        void configure(KnockbackConfig config) {
++            config.type = KnockbackConfig.Type.SIMPLE;
++            config.friction = 2.0D;
++            config.horizontal = 0.4D;
++            config.vertical = 0.44D;
++            config.verticalLimit = 0.44D;
++            config.extraHorizontal = 0.5D;
++            config.extraVertical = 0.14D;
++            config.rodHorizontalMultiplier = 1.1D;
++            config.rodVerticalMultiplier = 1.1D;
++        }
++    },
++
++    /**
++     * Heavy gear, long fights, tight combos. Knockback is cut so that armoured players
++     * stay in reach of each other instead of being launched apart.
++     */
++    OP("Short knockback and combo hold, for heavily geared fights.") {
++        @Override
++        void configure(KnockbackConfig config) {
++            config.type = KnockbackConfig.Type.CONSTANT;
++            config.constant.horizontal = 0.42D;
++            config.constant.vertical = 0.30D;
++            config.constant.verticalLongAir = 0.08D;
++            config.constant.horizontalSprintReset = 0.66D;
++
++            // Stops a victim drifting up and out of reach halfway through a combo.
++            config.combo.enabled = true;
++            config.combo.height = 2.3D;
++            config.combo.ticks = 10;
++            config.combo.velocity = -0.05D;
++        }
++    };
++
++    private final String summary;
++
++    KnockbackProfiles(String summary) {
++        this.summary = summary;
++    }
++
++    /** One line describing what this profile is for, shown by the command. */
++    public String summary() {
++        return this.summary;
++    }
++
++    abstract void configure(KnockbackConfig config);
++
++    /**
++     * Builds a fresh configuration for this profile.
++     * <p>
++     * A new {@link KnockbackConfig} starts at vanilla on every field, including the nested
++     * sections, and the profile then changes only what it cares about. Building rather than
++     * editing in place is what keeps a profile a clean slate: applying one discards whatever
++     * that world had before, which is what "apply a profile" should mean.
++     */
++    public KnockbackConfig build() {
++        KnockbackConfig config = new KnockbackConfig();
++        this.configure(config);
++        return config;
++    }
++
++    /** @return the profile with this name, ignoring case, or null. */
++    public static KnockbackProfiles byName(String name) {
++        for (KnockbackProfiles profile : values()) {
++            if (profile.name().equalsIgnoreCase(name)) {
++                return profile;
++            }
++        }
++
++        return null;
++    }
++}

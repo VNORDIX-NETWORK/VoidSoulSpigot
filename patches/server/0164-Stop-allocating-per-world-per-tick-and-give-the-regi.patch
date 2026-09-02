@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 09:43:04 -0500
+Subject: [PATCH] Stop allocating per world per tick, and give the region cache
+ an LRU
+
+Two fixes from the fork audit, both in code that runs once per world per
+tick or once per region file, and both worse the more worlds a server
+has - which is the shape of a prison server with private mines.
+
+Tracker flush (VNX-004). The controlled-flush block allocated a list per
+world per tick, unconditionally, and the only guard after it looked at
+the *global* player count rather than this world's. Two hundred empty
+mines meant two hundred allocations a tick for lists that stayed empty.
+The list is now a buffer reused across worlds and cleared in the same
+finally block that drains it, and a world with no players skips the loop
+entirely.
+
+Region file cache (VNX-003). RegionFileCache held a plain HashMap and,
+on reaching 256 entries, called a() - which closes and clears *every*
+open region file. That is a cliff, not a policy: the 257th access drops
+all 256 handles and the accesses after it reopen them one at a time. It
+is now an access-ordered LinkedHashMap that closes and drops only its
+least recently used entry, so the same 256 ceiling behaves as an LRU and
+files still in use stay open. Every path into the map is inside a
+synchronized method, so the reordering a read performs is safe here.
+
+Worth naming: a region file can still be closed while another thread
+holds the reference it was just handed. That race is not new - closing
+all 256 at once had it too, far more often - and this narrows it rather
+than fixing it. Fixing it properly means the locking rework the audit
+gates behind a production baseline.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index a0406511e4758e6bbb523f17a02449f654c63079..97fa0e276b15b0605bd592d68aa259a9dbc73d33 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -112,6 +112,9 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+     public org.bukkit.command.RemoteConsoleCommandSender remoteConsole;
+     //public ConsoleReader reader; // PandaSpigot - comment out
+     public static int currentTick = 0; // PaperSpigot - Further improve tick loop
++    // VoidSoulSpigot - reused across every world's tracker flush; main thread only, and
++    // always cleared in the finally block that drains it.
++    private final List<NetworkManager> voidsoulFlushBuffer = new ArrayList<NetworkManager>();
+     public final Thread primaryThread;
+     public java.util.Queue<Runnable> processQueue = new java.util.concurrent.ConcurrentLinkedQueue<Runnable>();
+     public int autosavePeriod;
+@@ -944,15 +947,27 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+                 voidsoulSectionStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start(); // VoidSoulSpigot - internal profiler
+                 worldserver.timings.tracker.startTiming(); // Spigot
+                 // PandaSpigot start - controlled flush for entity tracker packets
+-                List<NetworkManager> disabledFlushes = new ArrayList<>(worldserver.players.size());
+-                for (EntityHuman player : worldserver.players) {
+-                    if (!(player instanceof EntityPlayer)) continue; // skip non-player entities
+-                    PlayerConnection connection = ((EntityPlayer) player).playerConnection;
+-                    if (connection != null) {
+-                        connection.networkManager.disableAutomaticFlush();
+-                        disabledFlushes.add(connection.networkManager);
++                // VoidSoulSpigot start - do not allocate for a world nobody is in.
++                //
++                // This used to allocate a list per world per tick, unconditionally, and the
++                // only guard after it looked at the *global* player count rather than this
++                // world's. A prison server with two hundred empty private mines paid two
++                // hundred allocations a tick for lists that stayed empty. The list is now
++                // a buffer reused across worlds, and worlds with no players skip the block
++                // outright.
++                List<NetworkManager> disabledFlushes = this.voidsoulFlushBuffer;
++
++                if (!worldserver.players.isEmpty()) {
++                    for (EntityHuman player : worldserver.players) {
++                        if (!(player instanceof EntityPlayer)) continue; // skip non-player entities
++                        PlayerConnection connection = ((EntityPlayer) player).playerConnection;
++                        if (connection != null) {
++                            connection.networkManager.disableAutomaticFlush();
++                            disabledFlushes.add(connection.networkManager);
++                        }
+                     }
+                 }
++                // VoidSoulSpigot end
+                 try {
+                 // PandaSpigot end
+                 if (this.getPlayerList().getPlayerCount() > 0) { // PandaSpigot - Skip updating entity tracker if zero players online
+@@ -960,9 +975,11 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+                 } // PandaSpigot
+                 // PandaSpigot start - controlled flush for entity tracker packets
+                 } finally {
+-                    for (NetworkManager networkManager : disabledFlushes) {
+-                        networkManager.enableAutomaticFlush();
++                    for (int flushIndex = 0; flushIndex < disabledFlushes.size(); ++flushIndex) { // VoidSoulSpigot - indexed, no iterator allocation
++                        disabledFlushes.get(flushIndex).enableAutomaticFlush();
+                     }
++
++                    disabledFlushes.clear(); // VoidSoulSpigot - the buffer is reused by the next world
+                 }
+                 // PandaSpigot end
+                 worldserver.timings.tracker.stopTiming(); // Spigot
+diff --git a/src/main/java/net/minecraft/server/RegionFileCache.java b/src/main/java/net/minecraft/server/RegionFileCache.java
+index 4cfaf3005f94881d01e11f9bf9a771da141e190c..a16b0adbea487f5253ee094789aac0b6c88f48f4 100644
+--- a/src/main/java/net/minecraft/server/RegionFileCache.java
++++ b/src/main/java/net/minecraft/server/RegionFileCache.java
+@@ -1,6 +1,5 @@
+ package net.minecraft.server;
+ 
+-import com.google.common.collect.Maps;
+ import org.github.paperspigot.exception.ServerInternalException;
+ 
+ import java.io.DataInputStream;
+@@ -12,7 +11,42 @@ import java.util.Map;
+ 
+ public class RegionFileCache {
+ 
+-    public static final Map<File, RegionFile> a = Maps.newHashMap(); // Spigot - private -> public
++    // VoidSoulSpigot start - evict one region file at a time, least recently used first.
++    //
++    // This was a plain HashMap, and when it reached 256 entries the code below called a(),
++    // which closes and clears *every* open region file. That is a cliff, not a policy: on a
++    // server with many small worlds - a prison server with private mines is exactly that -
++    // the 257th access drops all 256 open handles and the accesses that follow reopen them
++    // one at a time.
++    //
++    // An access-ordered LinkedHashMap turns the same 256-entry ceiling into an LRU: the
++    // eldest entry is closed and dropped, and everything still in use stays open. Every
++    // path into this map is inside a synchronized method, so the reordering that a read
++    // performs on an access-ordered map is safe here.
++    private static final int MAX_OPEN_REGION_FILES = 256;
++
++    public static final Map<File, RegionFile> a = new java.util.LinkedHashMap<File, RegionFile>(MAX_OPEN_REGION_FILES, 0.75F, true) { // Spigot - private -> public
++        @Override
++        protected boolean removeEldestEntry(Map.Entry<File, RegionFile> eldest) {
++            if (this.size() <= MAX_OPEN_REGION_FILES) {
++                return false;
++            }
++
++            try {
++                RegionFile evicted = eldest.getValue();
++
++                if (evicted != null) {
++                    evicted.c();
++                }
++            } catch (IOException ioexception) {
++                ioexception.printStackTrace();
++                ServerInternalException.reportInternalException(ioexception);
++            }
++
++            return true;
++        }
++    };
++    // VoidSoulSpigot end
+ 
+     // PaperSpigot start
+     public static synchronized RegionFile a(File file, int i, int j) {
+@@ -32,10 +66,8 @@ public class RegionFileCache {
+                 file1.mkdirs();
+             }
+ 
+-            if (RegionFileCache.a.size() >= 256) {
+-                a();
+-            }
+-
++            // VoidSoulSpigot - the "close everything at 256" block that used to sit here is
++            // gone; the map evicts its least recently used entry on insert instead.
+             RegionFile regionfile1 = new RegionFile(file2);
+ 
+             RegionFileCache.a.put(file2, regionfile1);

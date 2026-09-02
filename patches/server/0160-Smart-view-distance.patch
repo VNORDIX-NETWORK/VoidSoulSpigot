@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 08:56:20 -0500
+Subject: [PATCH] Smart view distance
+
+Trades view distance for TPS while the server is behind. The signal is
+global, because TPS is a property of the server, but it is applied
+through PaperSpigot's per-player view distance API rather than by moving
+the server-wide setting.
+
+That choice buys the compatibility guard: this class remembers the value
+it last set, and skips any player whose distance is something else. A
+rank perk or lobby plugin that sets a distance for someone keeps it,
+instead of having it silently overwritten every five seconds.
+
+  smartViewDistance.enabled              off by default
+  smartViewDistance.min / max            floor and ceiling
+  smartViewDistance.checkIntervalTicks   how often TPS is read
+  smartViewDistance.recoveryDelayTicks   how long good TPS must hold
+  smartViewDistance.steps                the tps -> view distance ladder
+
+Cutting is immediate and restoring waits out recoveryDelayTicks. A view
+distance that tracks TPS symmetrically oscillates around a threshold, and
+each swing re-sends a ring of chunks to every player - spending exactly
+what it set out to save. Asymmetry is the whole design.
+
+Players who join while it is engaged arrive on the current target rather
+than getting the full distance and losing it a moment later. Turning the
+feature off at runtime hands everyone back the server view distance.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/chunk/SmartViewDistance.java b/src/main/java/com/voidsoul/spigot/chunk/SmartViewDistance.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..12a2a82f98b7e444fca1fd9514ddb20267c59a62
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/chunk/SmartViewDistance.java
+@@ -0,0 +1,141 @@
++package com.voidsoul.spigot.chunk;
++
++import com.voidsoul.spigot.config.VoidSoulConfig;
++import net.minecraft.server.EntityPlayer;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.WorldServer;
++
++import java.util.List;
++
++/**
++ * Trades view distance for TPS while the server is behind, and gives it back when it
++ * catches up.
++ * <p>
++ * The signal is global - TPS is a property of the server, not of a player - but the change
++ * is applied through the per-player view distance API, so a plugin that has deliberately
++ * set a distance for someone keeps it: this only ever moves a player it put where they are.
++ * <p>
++ * Main thread only.
++ */
++public final class SmartViewDistance {
++    /** Ticks of good TPS seen so far, counted toward the recovery delay. */
++    private static int recovering;
++
++    private static int lastTarget = -1;
++
++    private SmartViewDistance() {
++    }
++
++    /** Called every tick from the server tick; does its real work on the check interval. */
++    public static void tick(MinecraftServer server) {
++        VoidSoulConfig.SmartViewDistanceConfig config = VoidSoulConfig.getSmartViewDistance();
++
++        if (!config.enabled) {
++            if (lastTarget != -1) {
++                restoreAll(server); // switched off at runtime: hand everyone back their distance
++            }
++
++            return;
++        }
++
++        int interval = Math.max(1, config.checkIntervalTicks);
++
++        if (MinecraftServer.currentTick % interval != 0) {
++            return;
++        }
++
++        int max = config.max > 0 ? config.max : server.server.getViewDistance();
++        int min = Math.max(3, config.min);
++
++        if (max < min) {
++            max = min;
++        }
++
++        int target = targetFor(config, server.recentTps[0], max, min);
++
++        // Cut immediately, restore only after the server has held up for a while. A view
++        // distance that tracks TPS symmetrically oscillates across a threshold, and every
++        // swing re-sends a ring of chunks per player - paying the cost it meant to save.
++        if (lastTarget != -1 && target > lastTarget) {
++            recovering += interval;
++
++            if (recovering < Math.max(0, config.recoveryDelayTicks)) {
++                return;
++            }
++        }
++
++        recovering = 0;
++
++        if (target == lastTarget) {
++            return;
++        }
++
++        int previous = lastTarget;
++        lastTarget = target;
++        apply(server, target, previous);
++    }
++
++    /** The first step the server has fallen below decides the distance. */
++    private static int targetFor(VoidSoulConfig.SmartViewDistanceConfig config,
++                                 double tps, int max, int min) {
++        int target = max;
++        List<VoidSoulConfig.SmartViewDistanceConfig.Step> steps = config.steps;
++
++        if (steps != null) {
++            for (VoidSoulConfig.SmartViewDistanceConfig.Step step : steps) {
++                if (step != null && tps < step.tps && step.viewDistance < target) {
++                    target = step.viewDistance;
++                }
++            }
++        }
++
++        if (target < min) target = min;
++        if (target > max) target = max;
++
++        return target;
++    }
++
++    private static void apply(MinecraftServer server, int target, int previous) {
++        for (EntityPlayer player : server.getPlayerList().players) {
++            // Only move players this class put where they are. Anyone whose distance was
++            // set by a plugin - or who has never been touched by us - is left alone, so a
++            // per-player setting from a rank perk or a lobby plugin is not quietly undone.
++            if (previous != -1 && player.viewDistance != previous) {
++                continue;
++            }
++
++            set(player, target);
++        }
++    }
++
++    private static void restoreAll(MinecraftServer server) {
++        int previous = lastTarget;
++        lastTarget = -1;
++        recovering = 0;
++
++        int viewDistance = server.server.getViewDistance();
++
++        for (EntityPlayer player : server.getPlayerList().players) {
++            if (player.viewDistance == previous) {
++                set(player, viewDistance);
++            }
++        }
++    }
++
++    private static void set(EntityPlayer player, int viewDistance) {
++        if (player.world instanceof WorldServer) {
++            ((WorldServer) player.world).getPlayerChunkMap().updateViewDistance(player, viewDistance);
++        }
++    }
++
++    /**
++     * Puts a joining player straight on the current target, so someone who logs in while
++     * the server is struggling does not arrive with the full distance and then have it
++     * taken away a moment later.
++     */
++    public static void onJoin(EntityPlayer player) {
++        if (lastTarget != -1 && VoidSoulConfig.getSmartViewDistance().enabled) {
++            set(player, lastTarget);
++        }
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 41a02145b22873142200b42435226795691193bd..aae19da489719f44795ed15c9a7742a5dbaa0ae3 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -226,6 +226,69 @@ public class VoidSoulConfig {
+     }
+     // VoidSoulSpigot end
+ 
++    /** @return the smart view distance settings. Safe to call before the config is loaded. */
++    public static SmartViewDistanceConfig getSmartViewDistance() {
++        return config == null || config.smartViewDistance == null
++                ? DISABLED_VIEW_DISTANCE : config.smartViewDistance;
++    }
++
++    private static final SmartViewDistanceConfig DISABLED_VIEW_DISTANCE = new SmartViewDistanceConfig();
++
++    @Comment("Lower every player's view distance while the server is struggling, and put it\n" +
++            "back when it recovers.")
++    public SmartViewDistanceConfig smartViewDistance = new SmartViewDistanceConfig();
++
++    @ConfigSerializable
++    public static class SmartViewDistanceConfig {
++        @Comment("Off by default. Changing a player's view distance is not free - the chunks\n" +
++                "that come back into range are re-sent - so this is worth having only if you\n" +
++                "actually see TPS drops that view distance would relieve.")
++        public boolean enabled = false;
++
++        @Comment("Never go below this. 3 is the protocol minimum.")
++        public int min = 4;
++
++        @Comment("Never go above this. 0 uses spigot.yml's view-distance.")
++        public int max = 0;
++
++        @Comment("How often the current TPS is checked, in ticks. Default is 5 seconds.")
++        public int checkIntervalTicks = 100;
++
++        @Comment("How long TPS must stay good before the view distance is raised again.\n" +
++                "\n" +
++                "Cutting quickly and restoring slowly is deliberate. A view distance that\n" +
++                "follows TPS symmetrically oscillates around a threshold, and each swing\n" +
++                "re-sends a ring of chunks - which costs the very thing it was trying to\n" +
++                "save. Default is 30 seconds.")
++        public int recoveryDelayTicks = 600;
++
++        @Comment("The ladder, checked from the top down: the first entry whose tps the server\n" +
++                "has fallen below decides the view distance. Above every entry, max is used.")
++        public java.util.List<Step> steps = defaultSteps();
++
++        @ConfigSerializable
++        public static class Step {
++            public double tps = 18.0;
++            public int viewDistance = 8;
++
++            public Step() {
++            }
++
++            Step(double tps, int viewDistance) {
++                this.tps = tps;
++                this.viewDistance = viewDistance;
++            }
++        }
++
++        private static java.util.List<Step> defaultSteps() {
++            java.util.List<Step> steps = new java.util.ArrayList<Step>();
++            steps.add(new Step(18.0, 8));
++            steps.add(new Step(16.0, 6));
++            steps.add(new Step(14.0, 4));
++            return steps;
++        }
++    }
++
+     @Comment("The thread pool that reads chunks off the disk.")
+     public ChunkIoConfig chunkIo = new ChunkIoConfig();
+ 
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 93b3a9c16cd29be55eef09b0b869e9ad8fdf44a2..a0406511e4758e6bbb523f17a02449f654c63079 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -752,6 +752,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+ 
+         ++this.ticks;
+         com.voidsoul.spigot.chunk.ChunkSendBudget.startTick(); // VoidSoulSpigot - chunk send budget
++        com.voidsoul.spigot.chunk.SmartViewDistance.tick(this); // VoidSoulSpigot - smart view distance
+         if (this.T) {
+             this.T = false;
+             this.methodProfiler.a = true;
+diff --git a/src/main/java/net/minecraft/server/PlayerList.java b/src/main/java/net/minecraft/server/PlayerList.java
+index 412b354d1f57491bcb4f125e8d59e395bfe75da0..bd3ac00222af5a37b1f91ff6c8e891bf918872e6 100644
+--- a/src/main/java/net/minecraft/server/PlayerList.java
++++ b/src/main/java/net/minecraft/server/PlayerList.java
+@@ -308,6 +308,7 @@ public abstract class PlayerList {
+         this.players.add(entityplayer);
+         this.playersByName.put(entityplayer.getName(), entityplayer); // Spigot
+         this.j.put(entityplayer.getUniqueID(), entityplayer);
++        com.voidsoul.spigot.chunk.SmartViewDistance.onJoin(entityplayer); // VoidSoulSpigot - smart view distance
+         // this.sendAll(new PacketPlayOutPlayerInfo(PacketPlayOutPlayerInfo.EnumPlayerInfoAction.ADD_PLAYER, new EntityPlayer[] { entityplayer})); // CraftBukkit - replaced with loop below
+         WorldServer worldserver = this.server.getWorldServer(entityplayer.dimension);
+ 

@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 08:54:34 -0500
+Subject: [PATCH] Attribute blocking chunk loads, and size the chunk I/O pool
+
+Async chunk I/O in 1.8 covers exactly one caller: the player chunk map,
+and only for chunks that already exist on disk. Everything else - a mine
+reset, a schematic paste, a hopper reaching across a border, any plugin
+touching a block - goes through originalGetChunkAt and reads, or worse
+generates, inside the tick. The counters added with the profiler say how
+often that happens; they cannot say who did it, and who did it is the
+part you can act on.
+
+/vs perf trace on captures a stack on each blocking load and charges it
+to the first frame outside the server, keeping the deepest server frame
+alongside so the path is readable:
+
+     412 ms    38 loads, 12 generated  MineResetTask.run:88 <- World.getType
+
+Tracing is off by default and toggleable at runtime, because it is real
+work on a hot path - about ten microseconds against a disk read costing
+hundreds. Cheap next to what it measures, not free.
+
+The chunk I/O pool is now configurable (chunkIo.minThreads,
+playersPerThread, maxThreads) rather than fixed at two threads plus one
+per fifty players. Its player-count division was also two ints inside
+Math.ceil, so the ceil never rounded anything up and 199 players got
+three threads instead of four; that is now a floating point division.
+
+More I/O threads help on an SSD and do nothing on a spinning disk, so
+the comment says to raise it only against a measurement.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index e94d9634a86ba9e28e9de4fdfe74d84668cea0e7..41a02145b22873142200b42435226795691193bd 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -62,8 +62,12 @@ public class VoidSoulConfig {
+             dropMovedKnockbackSection(worldsNode); // VoidSoulSpigot - knockback lives in knockback.yml now
+             loader.save(root);
+ 
++            // VoidSoulSpigot start - internal profiler
+             com.voidsoul.spigot.perf.VoidSoulProfiler.setTimingsEnabled(
+-                    config.debug != null && config.debug.profiler); // VoidSoulSpigot - internal profiler
++                    config.debug != null && config.debug.profiler);
++            com.voidsoul.spigot.perf.ChunkLoadTracker.setEnabled(
++                    config.debug != null && config.debug.traceBlockingChunkLoads);
++            // VoidSoulSpigot end
+ 
+             // call after save
+             initWorlds(worldsNode);
+@@ -208,6 +212,42 @@ public class VoidSoulConfig {
+         public int maxBytesPerTick = 0;
+     }
+ 
++    // VoidSoulSpigot start - chunk I/O pool sizing. Safe to call before the config loads.
++    public static int getChunkIoMinThreads() {
++        return config == null || config.chunkIo == null ? 2 : Math.max(1, config.chunkIo.minThreads);
++    }
++
++    public static int getChunkIoPlayersPerThread() {
++        return config == null || config.chunkIo == null ? 50 : Math.max(1, config.chunkIo.playersPerThread);
++    }
++
++    public static int getChunkIoMaxThreads() {
++        return config == null || config.chunkIo == null ? 0 : config.chunkIo.maxThreads;
++    }
++    // VoidSoulSpigot end
++
++    @Comment("The thread pool that reads chunks off the disk.")
++    public ChunkIoConfig chunkIo = new ChunkIoConfig();
++
++    @ConfigSerializable
++    public static class ChunkIoConfig {
++        @Comment("Threads the pool keeps regardless of player count.")
++        public int minThreads = 2;
++
++        @Comment("One extra thread is added per this many players online.\n" +
++                "\n" +
++                "Chunks a player walks into are read on these threads instead of the main\n" +
++                "one; when the pool cannot keep up, the read happens inline and stalls the\n" +
++                "tick. More threads means more region files being read at once, which helps\n" +
++                "on an SSD or NVMe and does nothing at all on a spinning disk, where the\n" +
++                "seeks simply queue up somewhere else. Raise it only if /vs perf chunks shows\n" +
++                "blocking loads you cannot otherwise explain, and check that it helped.")
++        public int playersPerThread = 50;
++
++        @Comment("Hard cap on the pool size. 0 means no cap.")
++        public int maxThreads = 0;
++    }
++
+     @Comment("Built-in performance measurement, read with /vs perf.")
+     public DebugConfig debug = new DebugConfig();
+ 
+@@ -225,6 +265,18 @@ public class VoidSoulConfig {
+                 "/vs perf worlds. Blocking chunk load time is always measured, since a load\n" +
+                 "that hits the disk is already far more expensive than reading a clock.")
+         public boolean profiler = true;
++
++        @Comment("Capture a stack trace on every chunk load that blocks the main thread, so\n" +
++                "/vs perf trace can say which plugin or which server path is causing them.\n" +
++                "\n" +
++                "Counters can tell you a world did four hundred blocking loads a minute; they\n" +
++                "cannot tell you it was one mine reset, and that is the part you need in order\n" +
++                "to fix it. Capturing a stack costs roughly ten microseconds against a disk\n" +
++                "read costing hundreds, so it is cheap next to what it is measuring - but it\n" +
++                "is still work on the hot path, so leave it off and turn it on for a few\n" +
++                "minutes when you are hunting something. /vs perf trace on does that without\n" +
++                "a restart.")
++        public boolean traceBlockingChunkLoads = false;
+     }
+ 
+     @Comment("Protection against malicious clients.")
+diff --git a/src/main/java/com/voidsoul/spigot/perf/ChunkLoadTracker.java b/src/main/java/com/voidsoul/spigot/perf/ChunkLoadTracker.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d75cf42c753437e0053e8e6b252a8056b3adddd9
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/perf/ChunkLoadTracker.java
+@@ -0,0 +1,171 @@
++package com.voidsoul.spigot.perf;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++/**
++ * Works out who is causing blocking chunk loads.
++ * <p>
++ * Knowing that a world did four hundred synchronous loads a minute is only half an answer;
++ * the other half is which mine reset, which hopper, which plugin task did it, and that is
++ * not in any counter. So when tracing is on, every blocking load captures its stack and is
++ * charged to the first frame outside the server itself - the plugin that asked - falling
++ * back to the deepest server frame when nothing else is on the stack.
++ * <p>
++ * Capturing a stack costs somewhere around ten microseconds, against a disk read that costs
++ * hundreds. That ratio is why this is worth doing at all, and it is still off by default:
++ * it is a tool to point at a problem for a few minutes, not something to leave running.
++ */
++public final class ChunkLoadTracker {
++    /** Callers are kept until reset; a server has a bounded number of distinct call sites. */
++    private static final int MAX_CALLERS = 512;
++
++    private static final Map<String, Caller> CALLERS = new ConcurrentHashMap<String, Caller>();
++
++    private static volatile boolean enabled;
++
++    private ChunkLoadTracker() {
++    }
++
++    public static void setEnabled(boolean value) {
++        enabled = value;
++
++        if (!value) {
++            CALLERS.clear();
++        }
++    }
++
++    public static boolean isEnabled() {
++        return enabled;
++    }
++
++    /** One call site, with what its blocking loads have cost. */
++    public static final class Caller {
++        public final String frame;
++        final AtomicLong loads = new AtomicLong();
++        final AtomicLong nanos = new AtomicLong();
++        final AtomicLong generations = new AtomicLong();
++
++        Caller(String frame) {
++            this.frame = frame;
++        }
++
++        public long loads() {
++            return this.loads.get();
++        }
++
++        public long nanos() {
++            return this.nanos.get();
++        }
++
++        public long generations() {
++            return this.generations.get();
++        }
++    }
++
++    /**
++     * Charges one blocking load to whoever is on the stack.
++     *
++     * @param nanos      how long it took
++     * @param generated  whether the chunk had to be generated rather than read
++     */
++    public static void record(long nanos, boolean generated) {
++        if (!enabled) {
++            return;
++        }
++
++        String frame = findCaller();
++        Caller caller = CALLERS.get(frame);
++
++        if (caller == null) {
++            if (CALLERS.size() >= MAX_CALLERS) {
++                return; // a server with 512 distinct call sites has told us what we needed
++            }
++
++            Caller created = new Caller(frame);
++            caller = CALLERS.putIfAbsent(frame, created);
++
++            if (caller == null) {
++                caller = created;
++            }
++        }
++
++        caller.loads.incrementAndGet();
++        caller.nanos.addAndGet(nanos);
++
++        if (generated) {
++            caller.generations.incrementAndGet();
++        }
++    }
++
++    /**
++     * The frame to blame. Everything inside the chunk system itself is plumbing that every
++     * load goes through, so it is skipped; what is wanted is the caller that reached into
++     * a chunk in the first place.
++     */
++    private static String findCaller() {
++        StackTraceElement[] stack = new Throwable().getStackTrace();
++        StackTraceElement deepestServerFrame = null;
++
++        for (StackTraceElement element : stack) {
++            String className = element.getClassName();
++
++            if (className.startsWith("com.voidsoul.spigot.perf.")
++                    || className.equals("net.minecraft.server.ChunkProviderServer")
++                    || className.startsWith("org.bukkit.craftbukkit.chunkio.")) {
++                continue;
++            }
++
++            if (className.startsWith("net.minecraft.server.")
++                    || className.startsWith("org.bukkit.craftbukkit.")
++                    || className.startsWith("org.spigotmc.")
++                    || className.startsWith("com.hpfxd.pandaspigot.")
++                    || className.startsWith("com.voidsoul.spigot.")) {
++                if (deepestServerFrame == null) {
++                    deepestServerFrame = element;
++                }
++
++                continue;
++            }
++
++            // Something outside the server: a plugin, or the scheduler running one.
++            return format(element) + " <- " + (deepestServerFrame == null
++                    ? "?" : shortName(deepestServerFrame.getClassName()) + "." + deepestServerFrame.getMethodName());
++        }
++
++        return deepestServerFrame == null ? "unknown" : format(deepestServerFrame);
++    }
++
++    private static String format(StackTraceElement element) {
++        return shortName(element.getClassName()) + "." + element.getMethodName()
++                + ":" + element.getLineNumber();
++    }
++
++    private static String shortName(String className) {
++        int dot = className.lastIndexOf('.');
++        return dot < 0 ? className : className.substring(dot + 1);
++    }
++
++    /** Callers ordered by the main thread time they have cost, worst first. */
++    public static List<Caller> top(int limit) {
++        List<Caller> callers = new ArrayList<Caller>(CALLERS.values());
++
++        Collections.sort(callers, new Comparator<Caller>() {
++            @Override
++            public int compare(Caller a, Caller b) {
++                return Long.compare(b.nanos(), a.nanos());
++            }
++        });
++
++        return callers.size() > limit ? callers.subList(0, limit) : callers;
++    }
++
++    public static void reset() {
++        CALLERS.clear();
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index 59d18e6af2e2840171c19ec4c98d954b6143e789..33a6ff806753a6819dce0d94e098ae1c57e701a6 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -29,7 +29,7 @@ public final class PerfCommand extends Command {
+     private PerfCommand() {
+         super("vs");
+         this.description = "VoidSoulSpigot performance information";
+-        this.usageMessage = "/vs perf [chunks|worlds|packets|entities|reset]";
++        this.usageMessage = "/vs perf [chunks|worlds|packets|entities|trace|reset]";
+         this.setPermission(PERMISSION);
+         this.setAliases(Arrays.asList("voidsoul"));
+     }
+@@ -62,6 +62,8 @@ public final class PerfCommand extends Command {
+             this.packets(sender);
+         } else if (section.equals("entities")) {
+             this.entities(sender);
++        } else if (section.equals("trace")) {
++            this.trace(sender, args.length > 2 ? args[2].toLowerCase(Locale.ROOT) : "");
+         } else if (section.equals("reset")) {
+             VoidSoulProfiler.reset();
+             sender.sendMessage(ChatColor.GREEN + "Performance counters reset.");
+@@ -79,7 +81,11 @@ public final class PerfCommand extends Command {
+         }
+ 
+         if (args.length == 2 && args[0].equalsIgnoreCase("perf")) {
+-            return partial(args[1], Arrays.asList("chunks", "worlds", "packets", "entities", "reset"));
++            return partial(args[1], Arrays.asList("chunks", "worlds", "packets", "entities", "trace", "reset"));
++        }
++
++        if (args.length == 3 && args[0].equalsIgnoreCase("perf") && args[1].equalsIgnoreCase("trace")) {
++            return partial(args[2], Arrays.asList("on", "off", "reset"));
+         }
+ 
+         return Collections.emptyList();
+@@ -322,6 +328,53 @@ public final class PerfCommand extends Command {
+         footer(sender);
+     }
+ 
++    private void trace(CommandSender sender, String argument) {
++        if (argument.equals("on") || argument.equals("off")) {
++            boolean on = argument.equals("on");
++            ChunkLoadTracker.setEnabled(on);
++            sender.sendMessage(ChatColor.GREEN + "Blocking chunk load tracing "
++                    + (on ? "on. Leave it running a few minutes, then /vs perf trace."
++                    : "off."));
++            return;
++        }
++
++        if (argument.equals("reset")) {
++            ChunkLoadTracker.reset();
++            sender.sendMessage(ChatColor.GREEN + "Chunk load callers cleared.");
++            return;
++        }
++
++        if (!ChunkLoadTracker.isEnabled()) {
++            sender.sendMessage(ChatColor.RED + "Tracing is off. Turn it on with "
++                    + ChatColor.WHITE + "/vs perf trace on" + ChatColor.RED
++                    + ", wait a few minutes, then run this again.");
++            return;
++        }
++
++        List<ChunkLoadTracker.Caller> callers = ChunkLoadTracker.top(12);
++
++        header(sender, "What is blocking on chunk loads");
++
++        if (callers.isEmpty()) {
++            sender.sendMessage(LABEL + "Nothing has blocked on a chunk load since tracing "
++                    + "was turned on. That is the answer you want.");
++            sender.sendMessage(ChatColor.DARK_GRAY + "/vs perf trace off | reset");
++            return;
++        }
++
++        for (ChunkLoadTracker.Caller caller : callers) {
++            sender.sendMessage(String.format("%s%7.0f ms %s%5d loads%s%s  %s%s",
++                    VALUE, caller.nanos() / 1_000_000.0D,
++                    VALUE, caller.loads(), LABEL,
++                    caller.generations() > 0
++                            ? ", " + caller.generations() + " generated" : "",
++                    HEAD, caller.frame));
++        }
++
++        sender.sendMessage(LABEL + "Read as: caller <- the server path it went through.");
++        sender.sendMessage(ChatColor.DARK_GRAY + "/vs perf trace off | reset");
++    }
++
+     private void entities(CommandSender sender) {
+         header(sender, "Entities");
+ 
+@@ -400,7 +453,7 @@ public final class PerfCommand extends Command {
+     }
+ 
+     private static void footer(CommandSender sender) {
+-        sender.sendMessage(ChatColor.DARK_GRAY + "/vs perf chunks | worlds | packets | entities | reset");
++        sender.sendMessage(ChatColor.DARK_GRAY + "/vs perf chunks | worlds | packets | entities | trace | reset");
+     }
+ 
+     private static void line(CommandSender sender, String label, String value) {
+diff --git "a/src/main/java/com/voidsoul/spigot/perf/orlds \357\201\274 packets \357\201\274 entities \357\201\274 trace \357\201\274 reset\357\200\242\357\201\274" "b/src/main/java/com/voidsoul/spigot/perf/orlds \357\201\274 packets \357\201\274 entities \357\201\274 trace \357\201\274 reset\357\200\242\357\201\274"
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c561fedc788da54013d74394dc7ac436445c16f
+--- /dev/null
++++ "b/src/main/java/com/voidsoul/spigot/perf/orlds \357\201\274 packets \357\201\274 entities \357\201\274 trace \357\201\274 reset\357\200\242\357\201\274"	
+@@ -0,0 +1 @@
++        sender.sendMessage(ChatColor.DARK_GRAY + "/vs perf chunks );
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index c1906da3f78be9104d7993bca0c6d7eff61f5976..3182be6b7af22f569f27ea2cd460dbf4de703305 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -147,15 +147,13 @@ public class ChunkProviderServer implements IChunkProvider {
+                 long voidsoulStart = System.nanoTime();
+                 this.world.voidsoulStats.chunkLoadsSync.increment();
+                 chunk = ChunkIOExecutor.syncChunkLoad(world, loader, this, i, j);
+-                this.world.voidsoulStats.chunkLoadNanos.add(System.nanoTime() - voidsoulStart);
++                long voidsoulElapsed = System.nanoTime() - voidsoulStart;
++                this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++                com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, false);
+                 // VoidSoulSpigot end
+             }
+         } else if (chunk == null) {
+-            // VoidSoulSpigot start - internal profiler: disk read and/or generation, inline
+-            long voidsoulStart = System.nanoTime();
+-            chunk = originalGetChunkAt(i, j);
+-            this.world.voidsoulStats.chunkLoadNanos.add(System.nanoTime() - voidsoulStart);
+-            // VoidSoulSpigot end
++            chunk = originalGetChunkAt(i, j); // VoidSoulSpigot - accounted for inside
+         }
+ 
+         // If we didn't load the chunk async and have a callback run it now
+@@ -173,6 +171,8 @@ public class ChunkProviderServer implements IChunkProvider {
+         // CraftBukkit end
+ 
+         if (chunk == null) {
++            long voidsoulStart = System.nanoTime(); // VoidSoulSpigot - internal profiler
++            boolean voidsoulGenerated = false; // VoidSoulSpigot - internal profiler
+             world.timings.syncChunkLoadTimer.startTiming(); // Spigot
+             chunk = this.loadChunk(i, j);
+             if (chunk != null) this.world.voidsoulStats.chunkLoadsSync.increment(); // VoidSoulSpigot - internal profiler: read off the disk, on the main thread
+@@ -181,7 +181,10 @@ public class ChunkProviderServer implements IChunkProvider {
+                     chunk = this.emptyChunk;
+                 } else {
+                     try {
+-                        this.world.voidsoulStats.chunkGenerations.increment(); // VoidSoulSpigot - internal profiler
++                        // VoidSoulSpigot start - internal profiler
++                        this.world.voidsoulStats.chunkGenerations.increment();
++                        voidsoulGenerated = true;
++                        // VoidSoulSpigot end
+                         chunk = this.chunkProvider.getOrCreateChunk(i, j);
+                     } catch (Throwable throwable) {
+                         CrashReport crashreport = CrashReport.a(throwable, "Exception generating new chunk");
+@@ -228,6 +231,11 @@ public class ChunkProviderServer implements IChunkProvider {
+             // CraftBukkit end
+             chunk.loadNearby(this, this, i, j);
+             world.timings.syncChunkLoadTimer.stopTiming(); // Spigot
++            // VoidSoulSpigot start - internal profiler: this whole branch blocked the tick
++            long voidsoulElapsed = System.nanoTime() - voidsoulStart;
++            this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++            com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, voidsoulGenerated);
++            // VoidSoulSpigot end
+         }
+ 
+         return chunk;
+diff --git a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+index 69e5da4c65da46ad9d1456266cd4ad15b136f6e4..2ec0ae623e55bbc858a1a9fbf85d6c892fd6c02a 100644
+--- a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
++++ b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+@@ -26,7 +26,19 @@ public class ChunkIOExecutor {
+     }
+ 
+     public static void adjustPoolSize(int players) {
+-        int size = Math.max(BASE_THREADS, (int) Math.ceil(players / PLAYERS_PER_THREAD));
++        // VoidSoulSpigot start - configurable pool size. The original divided two ints
++        // inside Math.ceil, so the ceil did nothing and 199 players got three threads
++        // instead of four; the division is now done in floating point.
++        int perThread = com.voidsoul.spigot.config.VoidSoulConfig.getChunkIoPlayersPerThread();
++        int size = Math.max(com.voidsoul.spigot.config.VoidSoulConfig.getChunkIoMinThreads(),
++                (int) Math.ceil(players / (double) perThread));
++        int max = com.voidsoul.spigot.config.VoidSoulConfig.getChunkIoMaxThreads();
++
++        if (max > 0 && size > max) {
++            size = max;
++        }
++        // VoidSoulSpigot end
++
+         instance.setActiveThreads(size);
+     }
+ 

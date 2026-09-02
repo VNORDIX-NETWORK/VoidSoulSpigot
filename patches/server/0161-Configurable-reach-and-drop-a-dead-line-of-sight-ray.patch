@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 08:58:40 -0500
+Subject: [PATCH] Configurable reach, and drop a dead line of sight raytrace
+
+Vanilla's reach check is player.h(entity) < 36.0 - the squared distance
+between the two entities' origins. Two consequences worth naming: it
+allows six blocks when a 1.8 client can only swing at three, and because
+it measures foot to foot rather than eye to hitbox, the reach a player
+actually gets changes with the height difference between them. Standing
+on a block changes how far you can hit.
+
+combat.reach.mode picks the trade-off:
+
+  VANILLA   unchanged, and the default
+  DISTANCE  eye to the nearest point of the target's hitbox, against
+            combat.reach.maxDistance - reach becomes the same everywhere
+  RAYTRACE  DISTANCE, plus the look ray must meet the hitbox
+
+maxDistance defaults to 3.3 rather than the client's 3.0, and the hitbox
+is grown by combat.reach.tolerance first, because the server checks
+positions that are one ping old. Set it at exactly 3.0 and players on a
+bad connection lose hits they watched land. The comments say so, and say
+that RAYTRACE is the mode most likely to eat a legitimate hit.
+
+The hasLineOfSight() call goes with it. Its only consumer was the 9.0
+fallback that PandaSpigot disabled to fix GH-244, so since that patch
+every attack and interact packet has run a full block raytrace and
+discarded the answer - on a PvP server, once per hit per player.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/combat/ReachCheck.java b/src/main/java/com/voidsoul/spigot/combat/ReachCheck.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..35c0adb3a5313a5b629e39b5f95dcac498d89195
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/combat/ReachCheck.java
+@@ -0,0 +1,90 @@
++package com.voidsoul.spigot.combat;
++
++import com.voidsoul.spigot.config.VoidSoulWorldConfig;
++import net.minecraft.server.AxisAlignedBB;
++import net.minecraft.server.Entity;
++import net.minecraft.server.EntityHuman;
++import net.minecraft.server.Vec3D;
++
++/**
++ * Decides whether an attack packet is close enough to be honoured.
++ * <p>
++ * Vanilla compares the squared distance between the two entities' origins against 36, which
++ * is the origin of two well-known 1.8 quirks: the check is six blocks when the client can
++ * only swing at three, and because it measures foot to foot rather than eye to hitbox, the
++ * reach a player actually gets changes with the height difference between them. Standing on
++ * a block genuinely changes how far you can hit.
++ * <p>
++ * The modes here let a server pick its own trade-off. VANILLA is the default and behaves
++ * exactly as before.
++ */
++public final class ReachCheck {
++    /** Vanilla's constant: 6 blocks, squared, origin to origin. */
++    private static final double VANILLA_SQUARED = 36.0D;
++
++    private ReachCheck() {
++    }
++
++    public enum Mode {
++        /** Vanilla: squared origin-to-origin distance under 36. */
++        VANILLA,
++        /** Eye to the nearest point of the target's hitbox, against maxDistance. */
++        DISTANCE,
++        /** As DISTANCE, and the player's look ray must also meet the hitbox. */
++        RAYTRACE
++    }
++
++    /**
++     * @return whether {@code attacker} is allowed to reach {@code target}
++     */
++    public static boolean canReach(EntityHuman attacker, Entity target) {
++        VoidSoulWorldConfig.CombatConfig.ReachConfig config =
++                attacker.world.voidsoulConfig.combat.reach;
++
++        if (config == null || config.mode == null || config.mode == Mode.VANILLA) {
++            return attacker.h(target) < VANILLA_SQUARED;
++        }
++
++        double eyeX = attacker.locX;
++        double eyeY = attacker.locY + attacker.getHeadHeight();
++        double eyeZ = attacker.locZ;
++
++        AxisAlignedBB box = target.getBoundingBox();
++        double tolerance = Math.max(0.0D, config.tolerance);
++
++        if (tolerance > 0.0D) {
++            box = box.grow(tolerance, tolerance, tolerance);
++        }
++
++        double maxDistance = Math.max(0.0D, config.maxDistance);
++
++        if (distanceSquaredToBox(box, eyeX, eyeY, eyeZ) > maxDistance * maxDistance) {
++            return false;
++        }
++
++        if (config.mode == Mode.DISTANCE) {
++            return true;
++        }
++
++        Vec3D eye = new Vec3D(eyeX, eyeY, eyeZ);
++        Vec3D look = attacker.d(1.0F);
++        Vec3D end = new Vec3D(
++                eyeX + look.a * maxDistance,
++                eyeY + look.b * maxDistance,
++                eyeZ + look.c * maxDistance);
++
++        return box.a(eye, end) != null;
++    }
++
++    /**
++     * Squared distance from a point to the nearest point of a box, which is 0 when the point
++     * is inside it.
++     */
++    private static double distanceSquaredToBox(AxisAlignedBB box, double x, double y, double z) {
++        double dx = Math.max(box.a - x, Math.max(0.0D, x - box.d));
++        double dy = Math.max(box.b - y, Math.max(0.0D, y - box.e));
++        double dz = Math.max(box.c - z, Math.max(0.0D, z - box.f));
++
++        return dx * dx + dy * dy + dz * dz;
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index da16c9d3b9cd4e1a2a2294365153c7b5809ab4fd..97d503d5ddfc07b16f201e2fc63fe097673498b0 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -19,6 +19,48 @@ public class VoidSoulWorldConfig {
+         @Comment("Releases the item a player is consuming when they drop it, preventing\n" +
+                 "a desync where the player appears to keep eating.")
+         public boolean fixDropEatDesync = true;
++
++        @Comment("How far a player may reach to hit something.")
++        public ReachConfig reach = new ReachConfig();
++
++        @ConfigSerializable
++        public static class ReachConfig {
++            @Comment("VANILLA  - what 1.8 does: the squared distance between the two\n" +
++                    "           entities' origins must be under 36, so six blocks, measured\n" +
++                    "           foot to foot. Note what that second part means: because it\n" +
++                    "           measures origins and not eye to hitbox, the reach a player\n" +
++                    "           gets changes with the height difference between them, so\n" +
++                    "           standing on a block really does change how far you can hit.\n" +
++                    "DISTANCE - from the attacker's eye to the nearest point of the target's\n" +
++                    "           hitbox, against maxDistance. Removes the height dependence,\n" +
++                    "           so reach is the same everywhere.\n" +
++                    "RAYTRACE - DISTANCE, and the attacker's look ray must also meet the\n" +
++                    "           hitbox.\n" +
++                    "\n" +
++                    "Default is VANILLA, which changes nothing.")
++            public com.voidsoul.spigot.combat.ReachCheck.Mode mode =
++                    com.voidsoul.spigot.combat.ReachCheck.Mode.VANILLA;
++
++            @Comment("Reach in blocks, eye to hitbox, for DISTANCE and RAYTRACE. Ignored by\n" +
++                    "VANILLA.\n" +
++                    "\n" +
++                    "A 1.8 client will not swing at anything beyond 3.0, so 3.0 is the honest\n" +
++                    "number - but the server checks it against positions that are one ping\n" +
++                    "old, and in that time both players have moved. Set this at 3.0 exactly\n" +
++                    "and players on a bad connection lose hits they saw land. 3.3 leaves room\n" +
++                    "for that without giving anyone a real advantage.")
++            public double maxDistance = 3.3D;
++
++            @Comment("Blocks the target's hitbox is grown by before the check, absorbing the\n" +
++                    "difference between where the server thinks the target is and where the\n" +
++                    "attacker saw them. Raise it if players report hits not registering;\n" +
++                    "lower it towards 0 for a stricter server.\n" +
++                    "\n" +
++                    "RAYTRACE is the mode most likely to eat a legitimate hit, because it\n" +
++                    "also depends on the attacker's rotation being the one they had when they\n" +
++                    "clicked. Test it with real players before running it on a PvP server.")
++            public double tolerance = 0.1D;
++        }
+     }
+ 
+     @Comment("Projectile behaviour settings.")
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index 5ce2d2d7b08dffa2ec4710e51b876ca2d6727767..4988cb4de12d42eafba2e548cd61f739ffb70028 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1358,14 +1358,22 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+ 
+         this.player.resetIdleTimer();
+         if (entity != null) {
+-            boolean flag = this.player.hasLineOfSight(entity);
+-            double d0 = 36.0D;
+-
+-            if (false && !flag) { // PandaSpigot - Fix GH-244: Hit Registration Bug
+-                d0 = 9.0D;
+-            }
+-
+-            if (this.player.h(entity) < d0) {
++            // VoidSoulSpigot start - configurable reach. VANILLA keeps vanilla's constant.
++            //
++            // The hasLineOfSight() call that used to be here is gone with it. Its only
++            // consumer was the 9.0 fallback that PandaSpigot disabled to fix GH-244, so
++            // every attack and interact packet has been paying for a full block raytrace
++            // whose result was thrown away.
++            //
++            // boolean flag = this.player.hasLineOfSight(entity);
++            // double d0 = 36.0D;
++            //
++            // if (false && !flag) { // PandaSpigot - Fix GH-244: Hit Registration Bug
++            //     d0 = 9.0D;
++            // }
++
++            if (com.voidsoul.spigot.combat.ReachCheck.canReach(this.player, entity)) {
++            // VoidSoulSpigot end
+                 ItemStack itemInHand = this.player.inventory.getItemInHand(); // CraftBukkit
+ 
+                 if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT

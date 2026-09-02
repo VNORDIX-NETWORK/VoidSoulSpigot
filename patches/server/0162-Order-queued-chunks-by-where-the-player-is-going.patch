@@ -1,0 +1,193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 09:01:44 -0500
+Subject: [PATCH] Order queued chunks by where the player is going
+
+The chunk queue is sorted by distance alone, so a player running north
+gets the chunks behind them at the same priority as the ones they are
+about to walk into - and those trailing chunks may well fall out of range
+again before they are ever looked at.
+
+Each chunk's squared distance is now weighted by how well it lines up
+with the direction of travel, which movePlayer already knows: j1/k1, the
+chunk delta since the queue was last ordered. On a join or a view
+distance change there is no movement to go on, so the player's facing is
+used instead. With chunks.send.directionalBias at 0.35 a chunk straight
+ahead sorts as if it were 35% closer and one directly behind as if 35%
+further.
+
+Distance stays the dominant term, so this reorders rather than starves:
+a chunk one step behind the player (1.35) still outranks one three ahead
+(5.85), while at equal distance ahead (5.85) beats the side (9.0) beats
+behind (12.15). Nothing extra is sent and nothing is skipped.
+
+The bias is capped at 0.75, above which a distant chunk ahead would
+outrank the one the player is standing next to. A NaN in the config falls
+back to the plain distance sort rather than poisoning the comparison.
+
+The weighting needs a square root per comparison, so it is free on the
+twenty-odd chunks a normal step queues and costs a fraction of a
+millisecond on the four hundred a join or teleport queues; 0 restores the
+integer distance sort and skips it. Checked against TimSort's contract
+over 400 randomised sorts of up to 65x65 chunks.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 97d503d5ddfc07b16f201e2fc63fe097673498b0..a203c7c037af18b1258366d5222b1ee3090dedff 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -170,6 +170,25 @@ public class VoidSoulWorldConfig {
+                     "payload, before compression; the bytes on the wire are far fewer.\n" +
+                     "0 disables the byte budget.")
+             public int maxBytesPerTick = 524288;
++
++            @Comment("How much the direction a player is travelling counts when ordering the\n" +
++                    "chunks queued for them, from 0 to 0.75.\n" +
++                    "\n" +
++                    "The queue is sorted by distance alone, so a player running north gets the\n" +
++                    "chunks behind them at the same priority as the ones they are about to\n" +
++                    "walk into - and the ones behind may well be dropped again before they are\n" +
++                    "ever looked at. Each chunk's distance is now weighted by how closely it\n" +
++                    "lines up with the way the player is going: at 0.35 a chunk straight ahead\n" +
++                    "sorts as if it were 35% closer, and one directly behind as if 35% further.\n" +
++                    "\n" +
++                    "Nothing is skipped and nothing extra is sent - this only changes the order\n" +
++                    "chunks leave in, so what the player is about to see arrives first.\n" +
++                    "\n" +
++                    "The weighting needs a square root per comparison, which is free on the\n" +
++                    "twenty-odd chunks a normal step queues and costs a fraction of a\n" +
++                    "millisecond on the four hundred a join or teleport queues. 0 restores the\n" +
++                    "plain distance sort and skips that work entirely.")
++            public double directionalBias = 0.35D;
+         }
+ 
+         @Comment("Maximum number of sky light columns re-checked per chunk per tick.\n" +
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index 6a489b4514d565b47d930a6ed1abf94cd863cf54..aadafb38bf24a864f74b3fc75e632c1cafba65d2 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -296,13 +296,15 @@ public class PlayerChunkMap {
+                 entityplayer.e = entityplayer.locZ;
+ 
+                 // CraftBukkit start - send nearest chunks first
+-                Collections.sort(chunksToLoad, new ChunkCoordComparator(entityplayer));
++                // VoidSoulSpigot - j1/k1 is how far the player moved in chunks, which is the
++                // direction of travel; hand it to the comparator so what is ahead goes first.
++                Collections.sort(chunksToLoad, new ChunkCoordComparator(entityplayer, j1, k1));
+                 for (ChunkCoordIntPair pair : chunksToLoad) {
+                     this.a(pair.x, pair.z, true).a(entityplayer);
+                 }
+ 
+                 if (j1 > 1 || j1 < -1 || k1 > 1 || k1 < -1) {
+-                    Collections.sort(entityplayer.chunkCoordIntPairQueue, new ChunkCoordComparator(entityplayer));
++                    Collections.sort(entityplayer.chunkCoordIntPairQueue, new ChunkCoordComparator(entityplayer, j1, k1)); // VoidSoulSpigot - direction of travel
+                 }
+                 // CraftBukkit end
+             }
+@@ -619,11 +621,52 @@ public class PlayerChunkMap {
+     private static class ChunkCoordComparator implements java.util.Comparator<ChunkCoordIntPair> {
+         private int x;
+         private int z;
++        // VoidSoulSpigot start - directional priority
++        private final double bias;
++        private final double dirX;
++        private final double dirZ;
++        // VoidSoulSpigot end
+ 
+         public ChunkCoordComparator (EntityPlayer entityplayer) {
++            this(entityplayer, 0, 0); // VoidSoulSpigot - no movement to go on; fall back to facing
++        }
++
++        // VoidSoulSpigot start - directional priority
++        /**
++         * @param chunkDeltaX how many chunks the player has moved on X since the queue was
++         *                    last ordered, and the same on Z. Zero for a join or a view
++         *                    distance change, where the way the player is facing is used
++         *                    instead.
++         */
++        public ChunkCoordComparator(EntityPlayer entityplayer, int chunkDeltaX, int chunkDeltaZ) {
+             x = (int) entityplayer.locX >> 4;
+             z = (int) entityplayer.locZ >> 4;
++
++            double configured = entityplayer.world.voidsoulConfig.chunks.send.directionalBias;
++            double dx = chunkDeltaX;
++            double dz = chunkDeltaZ;
++
++            if (dx == 0.0D && dz == 0.0D) {
++                float yaw = entityplayer.yaw * 0.017453292F;
++                dx = -MathHelper.sin(yaw);
++                dz = MathHelper.cos(yaw);
++            }
++
++            double length = Math.sqrt(dx * dx + dz * dz);
++
++            if (!(configured > 0.0D) || length == 0.0D) { // VoidSoulSpigot - also catches a NaN in the config
++                this.bias = 0.0D;
++                this.dirX = 0.0D;
++                this.dirZ = 0.0D;
++            } else {
++                // Above 0.75 a chunk far ahead would outrank the one the player is standing
++                // next to, which is never what is wanted.
++                this.bias = Math.min(0.75D, configured);
++                this.dirX = dx / length;
++                this.dirZ = dz / length;
++            }
+         }
++        // VoidSoulSpigot end
+ 
+         public int compare(ChunkCoordIntPair a, ChunkCoordIntPair b) {
+             if (a.equals(b)) {
+@@ -636,11 +679,26 @@ public class PlayerChunkMap {
+             int bx = b.x - this.x;
+             int bz = b.z - this.z;
+ 
++            // VoidSoulSpigot start - directional priority: weight each chunk's squared
++            // distance by how well it lines up with where the player is going, so what they
++            // are about to walk into goes out before what they are leaving behind. Distance
++            // stays the dominant term, so the chunks around the player still come first.
++            if (this.bias != 0.0D) {
++                int result = Double.compare(score(ax, az), score(bx, bz));
++
++                if (result != 0) {
++                    return result;
++                }
++            } else {
++            // VoidSoulSpigot end
++
+             int result = ((ax - bx) * (ax + bx)) + ((az - bz) * (az + bz));
+             if (result != 0) {
+                 return result;
+             }
+ 
++            } // VoidSoulSpigot - directional priority
++
+             if (ax < 0) {
+                 if (bx < 0) {
+                     return bz - az;
+@@ -655,6 +713,25 @@ public class PlayerChunkMap {
+                 }
+             }
+         }
++
++        // VoidSoulSpigot start - directional priority
++        /**
++         * Squared distance, scaled down for chunks ahead of the player and up for chunks
++         * behind. A chunk exactly on the heading scores {@code (1 - bias)} of its distance,
++         * one directly behind {@code (1 + bias)}.
++         */
++        private double score(int dx, int dz) {
++            double distanceSquared = (double) dx * dx + (double) dz * dz;
++
++            if (distanceSquared == 0.0D) {
++                return 0.0D;
++            }
++
++            double alignment = (dx * this.dirX + dz * this.dirZ) / Math.sqrt(distanceSquared);
++
++            return distanceSquared * (1.0D - this.bias * alignment);
++        }
++        // VoidSoulSpigot end
+     }
+     // CraftBukkit end
+ }

@@ -1,0 +1,228 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 08:50:16 -0500
+Subject: [PATCH] Budget chunk sending by bytes, not just by chunk count
+
+maxBulkChunk counts chunks, so a flat mine chunk and a full cave chunk
+cost the same against it when one is about 25 KB and the other 176 KB.
+Ten of the large kind is 1.7 MB extracted, copied and queued in a single
+tick per player, and a join wave multiplies that by however many people
+arrive together - the spike that shows up as MSPT on join and teleport.
+
+The chunk send loop now also tracks bytes. The size comes from
+Chunk.getChunkMapSize(), which derives the payload length from the
+chunk's non-empty section count, so a chunk that gets held back costs
+nothing to skip - the packet is never built. What does not fit simply
+goes out on the following tick.
+
+  chunks.send.maxChunksPerTick   per player, 0 keeps spigot's maxBulkChunk
+  chunks.send.maxBytesPerTick    per player, default 512 KB
+  chunkSending.maxBytesPerTick   server-wide ceiling, off by default
+
+512 KB is deliberately above ten typical mine chunks, so in mine worlds
+the chunk count remains the limit that binds and the byte budget only
+steps in for dense terrain. The first chunk of a tick is always allowed
+through, so a chunk larger than the entire budget cannot wedge a queue.
+
+/vs perf chunks reports deferred sends, so it is visible when the budget
+is actually binding rather than assumed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/chunk/ChunkSendBudget.java b/src/main/java/com/voidsoul/spigot/chunk/ChunkSendBudget.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..689789d21415f2cfb367deddfc10cc681cde09b2
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/chunk/ChunkSendBudget.java
+@@ -0,0 +1,46 @@
++package com.voidsoul.spigot.chunk;
++
++import com.voidsoul.spigot.config.VoidSoulConfig;
++
++/**
++ * The server-wide half of the chunk send budget.
++ * <p>
++ * The per-player budget lives in the send loop itself, because that is where the decision
++ * is made. This is only the ceiling above it: a pool of bytes refilled at the start of
++ * every tick and drawn down by whoever sends first.
++ * <p>
++ * Main thread only - chunk sending happens in the player tick.
++ */
++public final class ChunkSendBudget {
++    private static int remaining;
++    private static boolean enabled;
++
++    private ChunkSendBudget() {
++    }
++
++    /** Refills the pool. Called once at the top of the server tick. */
++    public static void startTick() {
++        int budget = VoidSoulConfig.getChunkSendBytesPerTick();
++
++        enabled = budget > 0;
++        remaining = budget;
++    }
++
++    /**
++     * Takes {@code bytes} out of the pool.
++     *
++     * @return whether there was room. Always true when no ceiling is configured.
++     */
++    public static boolean take(int bytes) {
++        if (!enabled) {
++            return true;
++        }
++
++        if (remaining < bytes) {
++            return false;
++        }
++
++        remaining -= bytes;
++        return true;
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 3918419fac70d68e8f3ebd3006560c3c1935aa29..e94d9634a86ba9e28e9de4fdfe74d84668cea0e7 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -177,6 +177,37 @@ public class VoidSoulConfig {
+         public boolean asyncPlayerData = true;
+     }
+ 
++    /**
++     * @return the server-wide chunk byte ceiling, or 0 when there is none. Safe to call
++     *         before the config is loaded.
++     */
++    public static int getChunkSendBytesPerTick() {
++        return config == null || config.chunkSending == null ? 0 : config.chunkSending.maxBytesPerTick;
++    }
++
++    @Comment("Server-wide ceiling on chunk sending, on top of the per-player budget in\n" +
++            "each world's chunks.send section.")
++    public ChunkSendingConfig chunkSending = new ChunkSendingConfig();
++
++    @ConfigSerializable
++    public static class ChunkSendingConfig {
++        @Comment("Maximum number of bytes of chunk data the whole server may send per tick,\n" +
++                "across every player.\n" +
++                "\n" +
++                "This is a safety ceiling for the case the per-player budget cannot cover:\n" +
++                "two hundred players joining at once, each individually within its budget.\n" +
++                "\n" +
++                "Be aware of what it does when it binds. The budget is spent in player list\n" +
++                "order, so once it runs out the players near the end of the list wait for the\n" +
++                "next tick - the same players every tick. That is acceptable as a ceiling\n" +
++                "that almost never triggers and unacceptable as a routine limit, which is why\n" +
++                "it is off by default and the per-player budget is the one meant to do the\n" +
++                "work. If you enable it, set it well above (players x per-player budget) for\n" +
++                "a normal join rate.\n" +
++                "0 disables it.")
++        public int maxBytesPerTick = 0;
++    }
++
+     @Comment("Built-in performance measurement, read with /vs perf.")
+     public DebugConfig debug = new DebugConfig();
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 5f72825d592181c344a098ab811c36756f99362d..da16c9d3b9cd4e1a2a2294365153c7b5809ab4fd 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -99,6 +99,37 @@ public class VoidSoulWorldConfig {
+                 "0 means no limit.")
+         public int unloadDelayChunkLimit = 0;
+ 
++        @Comment("How much chunk data a single player may be sent per tick.")
++        public SendConfig send = new SendConfig();
++
++        @ConfigSerializable
++        public static class SendConfig {
++            @Comment("Maximum number of chunks sent to one player per tick.\n" +
++                    "0 uses spigot.yml's max-bulk-chunk (default 10).")
++            public int maxChunksPerTick = 0;
++
++            @Comment("Maximum number of bytes of chunk data sent to one player per tick.\n" +
++                    "\n" +
++                    "A chunk limit alone treats a flat mine chunk and a full cave chunk as\n" +
++                    "the same thing, when one is around 25 KB and the other 176 KB. Ten of\n" +
++                    "the large kind is 1.7 MB built, copied and queued inside a single tick,\n" +
++                    "for every player who just joined or teleported - which is what turns a\n" +
++                    "join wave into a CPU and network spike.\n" +
++                    "\n" +
++                    "The size is worked out from the chunk's non-empty section count before\n" +
++                    "the packet is built, so nothing is paid for a chunk that gets held back;\n" +
++                    "it simply goes out on the next tick instead. One chunk is always allowed\n" +
++                    "through per tick, so a chunk larger than the whole budget can never wedge\n" +
++                    "a player's queue.\n" +
++                    "\n" +
++                    "The default of 512 KB is deliberately above ten typical mine chunks, so\n" +
++                    "in mine worlds the chunk count stays the limit that actually binds and\n" +
++                    "this only steps in for dense terrain. Note the figure is the protocol\n" +
++                    "payload, before compression; the bytes on the wire are far fewer.\n" +
++                    "0 disables the byte budget.")
++            public int maxBytesPerTick = 524288;
++        }
++
+         @Comment("Maximum number of sky light columns re-checked per chunk per tick.\n" +
+                 "\n" +
+                 "When a block changes at or above the highest block in its column, that\n" +
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 0a01f5c7ceb3bd539e1f279816d27e18b8f892f8..2e0ae5915bcf5db2a2529449ff53864d7ce74ee3 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -250,14 +250,42 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+ 
+             Chunk chunk;
+ 
+-            while (iterator1.hasNext() && arraylist.size() < this.world.spigotConfig.maxBulkChunk) { // Spigot
++            // VoidSoulSpigot start - chunk send budget
++            com.voidsoul.spigot.config.VoidSoulWorldConfig.ChunksConfig.SendConfig sendConfig = this.world.voidsoulConfig.chunks.send;
++            int maxChunks = sendConfig.maxChunksPerTick > 0 ? sendConfig.maxChunksPerTick : this.world.spigotConfig.maxBulkChunk;
++            int byteBudget = sendConfig.maxBytesPerTick;
++            // VoidSoulSpigot end
++
++            while (iterator1.hasNext() && arraylist.size() < maxChunks) { // Spigot // VoidSoulSpigot - configurable chunk limit
+                 ChunkCoordIntPair chunkcoordintpair = (ChunkCoordIntPair) iterator1.next();
+ 
+                 if (chunkcoordintpair != null) {
+                     if (this.world.isLoaded(new BlockPosition(chunkcoordintpair.x << 4, 0, chunkcoordintpair.z << 4))) {
+                         chunk = this.world.getChunkAt(chunkcoordintpair.x, chunkcoordintpair.z);
+                         if (chunk.isReady()) {
+-                            voidsoulBytes += chunk.getChunkMapSize(); // VoidSoulSpigot - internal profiler
++                            // VoidSoulSpigot start - chunk send budget: a chunk's payload
++                            // size is known from its section count without building it, so
++                            // stopping here costs nothing. The first chunk always goes
++                            // through, otherwise a chunk bigger than the whole budget would
++                            // never be sent and the player's queue would never drain.
++                            int chunkBytes = chunk.getChunkMapSize();
++
++                            if (!arraylist.isEmpty()) {
++                                if (byteBudget > 0 && voidsoulBytes + chunkBytes > byteBudget) {
++                                    this.world.voidsoulStats.chunkSendsDeferred.increment();
++                                    break;
++                                }
++
++                                if (!com.voidsoul.spigot.chunk.ChunkSendBudget.take(chunkBytes)) {
++                                    this.world.voidsoulStats.chunkSendsDeferred.increment();
++                                    break;
++                                }
++                            } else {
++                                com.voidsoul.spigot.chunk.ChunkSendBudget.take(chunkBytes);
++                            }
++
++                            voidsoulBytes += chunkBytes;
++                            // VoidSoulSpigot end
+                             arraylist.add(chunk);
+                             arraylist1.addAll(chunk.tileEntities.values()); // CraftBukkit - Get tile entities directly from the chunk instead of the world
+                             iterator1.remove();
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 8a99382ba06cdf7d09286524fc859311a54f620b..93b3a9c16cd29be55eef09b0b869e9ad8fdf44a2 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -751,6 +751,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+         new com.destroystokyo.paper.event.server.ServerTickStartEvent(this.ticks + 1).callEvent(); // PandaSpigot - Add ServerTickStartEvent
+ 
+         ++this.ticks;
++        com.voidsoul.spigot.chunk.ChunkSendBudget.startTick(); // VoidSoulSpigot - chunk send budget
+         if (this.T) {
+             this.T = false;
+             this.methodProfiler.a = true;

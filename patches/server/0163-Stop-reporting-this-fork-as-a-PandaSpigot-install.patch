@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Wed, 2 Sep 2026 09:38:46 -0500
+Subject: [PATCH] Stop reporting this fork as a PandaSpigot install
+
+Metrics.java carried SERVICE_ID = 15154 - PandaSpigot's bStats service -
+and was constructed unconditionally on startup with bStats defaulting to
+enabled. Every server built from this fork counted itself as a
+PandaSpigot install on somebody else's dashboard, and sent its player
+count, online mode and version there. No server owner ever chose that.
+
+The id is now a constructor argument fed from the new metrics section,
+and the call only happens when the owner has both turned metrics on and
+supplied an id of their own:
+
+  metrics.enabled     false by default
+  metrics.serviceId   0 by default, nothing is sent while it is 0
+
+There is deliberately no default id. A default would be somebody else's.
+
+The call also moves below VoidSoulConfig.init(), because it used to run
+before any of the fork's configuration had loaded - so a guard placed at
+the old call site would have read an unloaded config and silently
+ignored whatever the owner had set.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/Metrics.java b/src/main/java/com/hpfxd/pandaspigot/Metrics.java
+index 9134394542f49f7c400a4a07b649048899694448..544e8f0017b477a60d4b5553b3308a0dd4b34f47 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/Metrics.java
++++ b/src/main/java/com/hpfxd/pandaspigot/Metrics.java
+@@ -34,10 +34,13 @@ import org.bukkit.configuration.file.YamlConfiguration;
+ import org.bukkit.entity.Player;
+ 
+ public class Metrics {
+-    private static final int SERVICE_ID = 15154;
++    // VoidSoulSpigot - the service id is no longer hardcoded. It used to be 15154, which is
++    // PandaSpigot's bStats service, so every server built from this fork was reporting
++    // itself as a PandaSpigot install on somebody else's dashboard. It is now supplied by
++    // the caller and defaults to off; see VoidSoulConfig.MetricsConfig.
+     private final MetricsBase metricsBase;
+ 
+-    public Metrics() {
++    public Metrics(int serviceId) { // VoidSoulSpigot - was Metrics()
+         // Get the config file
+         File bStatsFolder = new File((File) MinecraftServer.getServer().options.valueOf("plugins"), "bStats");
+         File configFile = new File(bStatsFolder, "config.yml");
+@@ -73,7 +76,7 @@ public class Metrics {
+             new MetricsBase(
+                 "bukkit",
+                 serverUUID,
+-                SERVICE_ID,
++                serviceId, // VoidSoulSpigot - was the hardcoded PandaSpigot service id
+                 enabled,
+                 this::appendPlatformData,
+                 this::appendServiceData,
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index aae19da489719f44795ed15c9a7742a5dbaa0ae3..d5db008bb038c67b4d32933a200eac15cef32320 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -311,6 +311,40 @@ public class VoidSoulConfig {
+         public int maxThreads = 0;
+     }
+ 
++    /**
++     * @return the bStats service id to report under, or 0 when metrics are off. Safe to
++     *         call before the config is loaded, and returns 0 in that case.
++     */
++    public static int getMetricsServiceId() {
++        if (config == null || config.metrics == null || !config.metrics.enabled) {
++            return 0;
++        }
++
++        return Math.max(0, config.metrics.serviceId);
++    }
++
++    @Comment("Anonymous usage statistics.")
++    public MetricsConfig metrics = new MetricsConfig();
++
++    @ConfigSerializable
++    public static class MetricsConfig {
++        @Comment("Send anonymous statistics to bStats: player count, online mode, and the\n" +
++                "server version.\n" +
++                "\n" +
++                "This is off by default, and deliberately so. The service id used to be\n" +
++                "hardcoded to PandaSpigot's, which meant every server built from this fork\n" +
++                "reported itself as a PandaSpigot install on somebody else's dashboard - and\n" +
++                "sent your player counts there. Nothing is sent now unless you turn this on\n" +
++                "and supply an id of your own.")
++        public boolean enabled = false;
++
++        @Comment("The bStats service id to report under. Register a service at\n" +
++                "https://bStats.org and put its id here. Nothing is sent while this is 0,\n" +
++                "even if enabled is true - there is no default id on purpose, because a\n" +
++                "default would be somebody else's.")
++        public int serviceId = 0;
++    }
++
+     @Comment("Built-in performance measurement, read with /vs perf.")
+     public DebugConfig debug = new DebugConfig();
+ 
+diff --git a/src/main/java/net/minecraft/server/DedicatedServer.java b/src/main/java/net/minecraft/server/DedicatedServer.java
+index f907e5b45d92fa3f8d7690e3de5e35b3d522bf9f..a315c40ecc058a22301c59e35e7048ccd8283478 100644
+--- a/src/main/java/net/minecraft/server/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/DedicatedServer.java
+@@ -182,7 +182,8 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             this.a((PlayerList) (new DedicatedPlayerList(this)));
+             org.spigotmc.SpigotConfig.init((File) options.valueOf("spigot-settings"));
+             org.spigotmc.SpigotConfig.registerCommands();
+-            new com.hpfxd.pandaspigot.Metrics(); // PandaSpigot
++            // VoidSoulSpigot - metrics moved below, after VoidSoulConfig has loaded, since
++            // the service id now comes from it. Was: new com.hpfxd.pandaspigot.Metrics();
+             // Spigot end
+             java.net.SocketAddress bindAddress;
+             if (this.getServerIp().startsWith("unix:")) {
+@@ -215,6 +216,16 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             com.voidsoul.spigot.config.VoidSoulKnockbackConfig.init(com.voidsoul.spigot.config.VoidSoulConfigFolder.prepare((File) options.valueOf("knockback-settings"))); // VoidSoulSpigot
+             com.voidsoul.spigot.knockback.KnockbackCommand.register(); // VoidSoulSpigot
+             com.voidsoul.spigot.perf.PerfCommand.register(); // VoidSoulSpigot - internal profiler
++            // VoidSoulSpigot start - only report to a bStats service this server owns. The
++            // id used to be hardcoded to PandaSpigot's, so every install built from this
++            // fork reported itself as one of theirs, player counts included. Nothing is
++            // sent unless metrics.enabled is on and metrics.serviceId is set.
++            int voidsoulMetricsId = com.voidsoul.spigot.config.VoidSoulConfig.getMetricsServiceId();
++
++            if (voidsoulMetricsId > 0) {
++                new com.hpfxd.pandaspigot.Metrics(voidsoulMetricsId);
++            }
++            // VoidSoulSpigot end
+             // PaperSpigot start
+             org.github.paperspigot.PaperSpigotConfig.init((File) options.valueOf("paper-settings"));
+             org.github.paperspigot.PaperSpigotConfig.registerCommands();
