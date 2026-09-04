@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 14:41:51 -0500
+Subject: [PATCH] Only count section time that actually blocked a tick
+
+The section averages summed to more than the average tick they were
+supposedly inside - 2.92 ms of sections against a 1.9 ms MSPT - which
+made the "other" remainder nonsense, since it came out negative and was
+hidden rather than reported.
+
+The cause is chunk loading outside the tick loop: the spawn area during
+startup, and callbacks that run between ticks. That time is real, but it
+belongs to no tick, and charging it to a section put it in an average
+divided by tick count.
+
+The profiler now knows whether a tick is open, and section time recorded
+outside one is dropped. Sections add up to the tick again, so "other" is
+a number rather than a symptom.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index 1c2f49aae96e914dda6fb1d16e480f533e5eceac..e70e0c51a49979bc3250647244534a74bb178b1c 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -139,9 +139,23 @@ public final class VoidSoulProfiler {
+         }
+     }
+ 
++    /**
++     * Whether the server is currently inside a tick.
++     * <p>
++     * Chunks are loaded outside the tick loop too - the spawn area on startup, callbacks
++     * between ticks - and charging that time to a section made the sections add up to more
++     * than the tick they were supposedly inside, which in turn made the "other" remainder
++     * meaningless. Work outside a tick belongs to no tick and is not counted.
++     */
++    private static boolean inTick;
++
++    public static boolean isInTick() {
++        return inTick;
++    }
++
+     /** Attributes time to the current tick without a rolling counter of its own. */
+     public static void recordSection(int section, long nanos) {
+-        if (section >= 0 && section < SECTION_COUNT) {
++        if (inTick && section >= 0 && section < SECTION_COUNT) {
+             currentTick[section] += nanos;
+         }
+     }
+@@ -247,6 +261,7 @@ public final class VoidSoulProfiler {
+      * a 26 ms tick came to report 796 ms of chunk loading.
+      */
+     public static void startTick() {
++        inTick = true;
+         java.util.Arrays.fill(currentTick, 0L);
+ 
+         // Zeroed rather than cleared: the entries are one per plugin and are reused every
+@@ -291,6 +306,7 @@ public final class VoidSoulProfiler {
+         }
+ 
+         logSpike(durationNanos); // VoidSoulSpigot - write down a spike as it happens
++        inTick = false; // VoidSoulSpigot - work after this belongs to no tick
+ 
+         long now = System.nanoTime();
+ 
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 353abb40af76ccbf41a44f7cf6e970433a877cbc..002ec78f3ccd15678885d1f743754ff0e3362d35 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -148,7 +148,7 @@ public class ChunkProviderServer implements IChunkProvider {
+                 this.world.voidsoulStats.chunkLoadsSync.increment();
+                 chunk = ChunkIOExecutor.syncChunkLoad(world, loader, this, i, j);
+                 long voidsoulElapsed = System.nanoTime() - voidsoulStart;
+-                this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++                if (com.voidsoul.spigot.perf.VoidSoulProfiler.isInTick()) this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed); // VoidSoulSpigot - only time that blocked a tick
+                 com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
+                         com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_CHUNK_LOAD, voidsoulElapsed);
+                 com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, false);
+@@ -235,7 +235,7 @@ public class ChunkProviderServer implements IChunkProvider {
+             world.timings.syncChunkLoadTimer.stopTiming(); // Spigot
+             // VoidSoulSpigot start - internal profiler: this whole branch blocked the tick
+             long voidsoulElapsed = System.nanoTime() - voidsoulStart;
+-            this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++            if (com.voidsoul.spigot.perf.VoidSoulProfiler.isInTick()) this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed); // VoidSoulSpigot - only time that blocked a tick
+             com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
+                     com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_CHUNK_LOAD, voidsoulElapsed);
+             com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, voidsoulGenerated);

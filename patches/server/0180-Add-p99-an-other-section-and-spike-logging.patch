@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 14:36:00 -0500
+Subject: [PATCH] Add p99, an "other" section, and spike logging
+
+Three gaps in the measurement, all of them things that have to exist
+before an optimisation can be justified rather than assumed.
+
+p99 sits next to p95. They answer different questions: p95 is how the
+server feels most of the time, p99 is how often it stutters, and a server
+can hold a good p95 while one tick in a hundred is terrible.
+
+"Other" is the part of the average tick the sections do not cover - the
+network tick, the player list, tickables, and plugins inside Bukkit
+events. It was previously visible only on the worst tick, so the averages
+silently did not add up to the MSPT above them. A large "other" is where
+to look next, which is worth showing rather than hiding.
+
+Spike logging writes a tick over debug.logTickSpikesOverMs to the log
+with its breakdown, as it happens. /vs perf reports the worst tick of the
+last minute, but only when somebody runs it - a spike at four in the
+morning is gone by the time anyone reads about it. Rate limited by
+debug.spikeLogIntervalTicks, because a struggling server spikes every
+tick and a line for each turns a performance problem into a disk problem.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 1bd776047270b81df09d19e0675f80caf8226057..a5cfbdca73b74ae2949c777d91e70bc0c2da45e6 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -490,6 +490,11 @@ public class VoidSoulConfig {
+         }
+     }
+ 
++    /** @return the debug settings, or null before the config has loaded. */
++    public static DebugConfig getDebug() {
++        return config == null ? null : config.debug;
++    }
++
+     @Comment("Built-in performance measurement, read with /vs perf.")
+     public DebugConfig debug = new DebugConfig();
+ 
+@@ -519,6 +524,25 @@ public class VoidSoulConfig {
+                 "minutes when you are hunting something. /vs perf trace on does that without\n" +
+                 "a restart.")
+         public boolean traceBlockingChunkLoads = false;
++
++        @Comment("Log a line whenever a single tick goes over this many milliseconds, with\n" +
++                "the breakdown of where that tick's time went.\n" +
++                "\n" +
++                "/vs perf already reports the worst tick of the last minute, but only when\n" +
++                "somebody is looking. A spike at four in the morning is gone by the time you\n" +
++                "read about it, so this writes it down as it happens.\n" +
++                "\n" +
++                "50 ms is a full tick, meaning the server is already behind by the time one\n" +
++                "is logged. Lower it to catch smaller stutters, raise it if a busy server\n" +
++                "makes the log noisy. 0 turns the logging off.")
++        public int logTickSpikesOverMs = 50;
++
++        @Comment("Never log more than one spike per this many ticks.\n" +
++                "\n" +
++                "A server that is genuinely struggling produces a spike every tick, and a\n" +
++                "log line for each of them turns a performance problem into a disk problem.\n" +
++                "Default is one every five seconds.")
++        public int spikeLogIntervalTicks = 100;
+     }
+ 
+     @Comment("Protection against malicious clients.")
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index 05e3cae8c36f837604fc27e04455748107332892..d161d903a9daefd03ce1795b85ebd03bc85d775e 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -133,8 +133,8 @@ public final class PerfCommand extends Command {
+         if (ticks.samples == 0) {
+             line(sender, "MSPT", "collecting...");
+         } else {
+-            line(sender, "MSPT", String.format("avg %.1f  p50 %.1f  p95 %.1f  max %.1f",
+-                    ticks.average, ticks.median, ticks.percentile95, ticks.max));
++            line(sender, "MSPT", String.format("avg %.1f  p50 %.1f  p95 %.1f  p99 %.1f  max %.1f",
++                    ticks.average, ticks.median, ticks.percentile95, ticks.percentile99, ticks.max));
+         }
+ 
+         if (VoidSoulProfiler.isTimingsEnabled()) {
+@@ -163,6 +163,22 @@ public final class PerfCommand extends Command {
+                     + LABEL + " (blocking)");
+             line(sender, "  Scheduler", millisPerTick(VoidSoulProfiler.schedulerNanos.window(WINDOW), tickCount));
+             line(sender, "  Save", millisPerTick(VoidSoulProfiler.saveNanos.window(WINDOW), tickCount));
++
++            // VoidSoulSpigot start - whatever the sections do not cover: the network tick,
++            // the player list, tickables, and plugins running inside Bukkit events. Shown
++            // rather than left as a gap between the sections and the MSPT above, since a
++            // large "other" is where to look next.
++            double accounted = (worldNanos + entityNanos + trackerNanos + chunkLoadNanos
++                    + VoidSoulProfiler.chunkSendNanos.window(WINDOW)
++                    + VoidSoulProfiler.schedulerNanos.window(WINDOW)
++                    + VoidSoulProfiler.saveNanos.window(WINDOW)) / 1_000_000.0D / tickCount;
++            double other = ticks.average - accounted;
++
++            if (other >= 0.05D) {
++                line(sender, "  Other", String.format("%.2f ms", other) + LABEL
++                        + " (network, player list, events)");
++            }
++            // VoidSoulSpigot end
+         }
+ 
+         // VoidSoulSpigot start - what the single worst tick was actually made of.
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index c2caab5dd9762ebc36dd457de732e00c1b5e2f1a..1c2f49aae96e914dda6fb1d16e480f533e5eceac 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -290,6 +290,8 @@ public final class VoidSoulProfiler {
+             worstPluginNanos[worstIndex] = topNanos;
+         }
+ 
++        logSpike(durationNanos); // VoidSoulSpigot - write down a spike as it happens
++
+         long now = System.nanoTime();
+ 
+         if (now - lastRollNanos >= 1_000_000_000L) {
+@@ -309,6 +311,66 @@ public final class VoidSoulProfiler {
+         }
+     }
+ 
++    // --- spike logging ------------------------------------------------------------------
++
++    private static int lastSpikeTick = Integer.MIN_VALUE;
++
++    /**
++     * Writes a spike to the log as it happens.
++     * <p>
++     * /vs perf reports the worst tick of the last minute, but only when somebody runs it. A
++     * spike at four in the morning is gone by the time anyone reads about it; this records
++     * it with the same breakdown, rate limited so a server that is genuinely struggling
++     * does not turn a performance problem into a disk problem.
++     */
++    private static void logSpike(long durationNanos) {
++        com.voidsoul.spigot.config.VoidSoulConfig.DebugConfig config =
++                com.voidsoul.spigot.config.VoidSoulConfig.getDebug();
++
++        if (config == null || config.logTickSpikesOverMs <= 0) {
++            return;
++        }
++
++        double millis = durationNanos / 1_000_000.0D;
++
++        if (millis < config.logTickSpikesOverMs) {
++            return;
++        }
++
++        int tick = net.minecraft.server.MinecraftServer.currentTick;
++
++        if (tick - lastSpikeTick < Math.max(1, config.spikeLogIntervalTicks)) {
++            return;
++        }
++
++        lastSpikeTick = tick;
++
++        StringBuilder message = new StringBuilder(160);
++        message.append(String.format("[VoidSoul] Tick spike: %.1f ms", millis));
++
++        double accounted = 0.0D;
++
++        for (int section = 0; section < SECTION_COUNT; section++) {
++            double cost = currentTick[section] / 1_000_000.0D;
++            accounted += cost;
++
++            if (cost >= 0.5D) {
++                message.append(String.format("  %s %.1f", SECTION_NAMES[section], cost));
++            }
++        }
++
++        double other = millis - accounted;
++
++        if (other >= 1.0D) {
++            // Named rather than hidden: the sections do not cover the network tick, the
++            // player list, or a plugin inside a Bukkit event, so a large remainder says
++            // where to look next instead of looking like a measurement failure.
++            message.append(String.format("  other %.1f", other));
++        }
++
++        org.bukkit.Bukkit.getLogger().warning(message.toString());
++    }
++
+     private static void sampleGarbageCollection() {
+         long collections = 0L;
+         long millis = 0L;
+@@ -340,13 +402,16 @@ public final class VoidSoulProfiler {
+         public final double average;
+         public final double median;
+         public final double percentile95;
++        public final double percentile99;
+         public final double max;
+ 
+-        TickStats(int samples, double average, double median, double percentile95, double max) {
++        TickStats(int samples, double average, double median, double percentile95,
++                  double percentile99, double max) {
+             this.samples = samples;
+             this.average = average;
+             this.median = median;
+             this.percentile95 = percentile95;
++            this.percentile99 = percentile99;
+             this.max = max;
+         }
+     }
+@@ -363,7 +428,7 @@ public final class VoidSoulProfiler {
+         int wanted = Math.min(seconds * 20, tickFilled);
+ 
+         if (wanted <= 0) {
+-            return new TickStats(0, 0.0D, 0.0D, 0.0D, 0.0D);
++            return new TickStats(0, 0.0D, 0.0D, 0.0D, 0.0D, 0.0D);
+         }
+ 
+         long[] sample = new long[wanted];
+@@ -384,6 +449,7 @@ public final class VoidSoulProfiler {
+                 toMillis(sum / (double) wanted),
+                 toMillis(sample[wanted / 2]),
+                 toMillis(sample[Math.min(wanted - 1, (int) (wanted * 0.95D))]),
++                toMillis(sample[Math.min(wanted - 1, (int) (wanted * 0.99D))]),
+                 toMillis(sample[wanted - 1]));
+     }
+ 

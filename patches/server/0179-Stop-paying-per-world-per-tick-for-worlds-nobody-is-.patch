@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 14:36:00 -0500
+Subject: [PATCH] Stop paying per world per tick for worlds nobody is in
+
+Two allocations in the tick loop that scale with world count rather than
+with anything being used. On a prison server running a world per private
+mine, world count is the number that grows.
+
+Time updates (MinecraftServer). A PacketPlayOutUpdateTime was built, and
+doDaylightCycle looked up by string key, once per world per tick - before
+checking whether the world had any players. The loop that follows
+iterates world.players, so an empty world produced nothing either way;
+this stops paying for the nothing. The shared packet is also built on
+first use, so a tick whose frequency check admits nobody builds none.
+
+Entity tracker (EntityTracker.updatePlayers). Allocated a fresh ArrayList
+every tick for every world, to hold players whose position moved far
+enough to need a rescan - overwhelmingly empty on a server with many
+small worlds. It is now a reused buffer, cleared before use and again
+after, so player references are not held between ticks.
+
+track() itself is still called for every world. It keeps position deltas
+and tick counters the tracker relies on, so skipping it for an empty
+world would freeze state rather than save work - the allocation was the
+waste, not the call.
+
+At 200 worlds this is 400 fewer objects per tick, or 8000 a second. The
+effect on a three-world test server is below the noise floor; the place
+to read it is GC collections in /vs perf on a server with the world count
+that made it worth doing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/net/minecraft/server/EntityTracker.java b/src/main/java/net/minecraft/server/EntityTracker.java
+index cb72b36725927272fddfdad929b268a7b06140ac..089dda962594597594920c2950ca9c5db435e404 100644
+--- a/src/main/java/net/minecraft/server/EntityTracker.java
++++ b/src/main/java/net/minecraft/server/EntityTracker.java
+@@ -167,8 +167,15 @@ public class EntityTracker {
+ 
+     }
+ 
++    // VoidSoulSpigot - reused across ticks. This was allocated fresh every tick for every
++    // world, and only ever holds players whose position moved enough to need a rescan - so
++    // on a server with many small worlds it was overwhelmingly an empty list allocated and
++    // thrown away. Main thread only, and cleared before use.
++    private final ArrayList<EntityPlayer> voidsoulMovedPlayers = new ArrayList<EntityPlayer>();
++
+     public void updatePlayers() {
+-        ArrayList arraylist = Lists.newArrayList();
++        ArrayList arraylist = this.voidsoulMovedPlayers; // VoidSoulSpigot - was Lists.newArrayList()
++        arraylist.clear(); // VoidSoulSpigot
+         Iterator iterator = this.c.iterator();
+ 
+         while (iterator.hasNext()) {
+@@ -193,6 +200,7 @@ public class EntityTracker {
+             }
+         }
+ 
++        arraylist.clear(); // VoidSoulSpigot - do not hold player references between ticks
+     }
+ 
+     public void a(EntityPlayer entityplayer) {
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 5dd502a5e09b8e702cd644e81316ecdf88139066..af76c32d7c678c599b8ad936cb6d815d3f512dcb 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -887,18 +887,43 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+         // Send time updates to everyone, it will get the right time from the world the player is in.
+         // PandaSpigot start - optimize time updates
+         for (final WorldServer world : this.worlds) {
++            // VoidSoulSpigot start - do none of this for a world nobody is in.
++            //
++            // The packet below was built, and the game rule looked up by string key, once
++            // per world per tick regardless of whether anyone would receive it. A prison
++            // server with two hundred private mines paid two hundred allocations and two
++            // hundred map lookups every tick for packets that were discarded. The loop
++            // that follows iterates world.players, so an empty world produced nothing
++            // either way - this only stops paying for the nothing.
++            if (world.players.isEmpty()) {
++                continue;
++            }
++            // VoidSoulSpigot end
+             final boolean doDaylight = world.getGameRules().getBoolean("doDaylightCycle");
+             final long dayTime = world.getDayTime();
+             long worldTime = world.getTime();
+-            final PacketPlayOutUpdateTime worldPacket = new PacketPlayOutUpdateTime(worldTime, dayTime, doDaylight);
++            PacketPlayOutUpdateTime worldPacket = null; // VoidSoulSpigot - built on first use
+             for (EntityHuman entityhuman : world.players) {
+                 if (!(entityhuman instanceof EntityPlayer) || (this.ticks + entityhuman.getId()) % world.pandaSpigotConfig.timeUpdateFrequency != 0) {
+                     continue;
+                 }
+                 EntityPlayer entityplayer = (EntityPlayer) entityhuman;
+                 long playerTime = entityplayer.getPlayerTime();
+-                PacketPlayOutUpdateTime packet = (playerTime == dayTime) ? worldPacket :
+-                        new PacketPlayOutUpdateTime(worldTime, playerTime, doDaylight);
++                // VoidSoulSpigot - the shared packet is built the first time a player is
++                // actually due one. Players on their own time never build it at all, and
++                // the frequency check above means most ticks reach here for nobody.
++                PacketPlayOutUpdateTime packet;
++
++                if (playerTime == dayTime) {
++                    if (worldPacket == null) {
++                        worldPacket = new PacketPlayOutUpdateTime(worldTime, dayTime, doDaylight);
++                    }
++
++                    packet = worldPacket;
++                } else {
++                    packet = new PacketPlayOutUpdateTime(worldTime, playerTime, doDaylight);
++                }
++
+                 entityplayer.playerConnection.sendPacket(packet); // Add support for per player time
+             }
+         }
