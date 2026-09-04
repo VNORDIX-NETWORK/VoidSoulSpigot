@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 23:41:07 -0500
+Subject: [PATCH] Report what the worst tick was made of
+
+The section averages can say where a spike was not, and never where it
+was. A single 200 ms tick spread across a minute of ticks contributes
+0.17 ms to whichever section caused it, which is indistinguishable from
+noise - so a server that stutters once a minute gets a "max" figure and
+no way to attribute it.
+
+Each section's cost is now also accumulated for the tick in progress, and
+the worst tick of every second keeps its own breakdown. /vs perf reports
+that breakdown next to the max it already showed, for the same tick.
+
+The remainder is reported too, and deliberately: the measured sections do
+not cover the network tick, the player list, or a plugin running inside a
+Bukkit event, so a spike that lands almost entirely outside them is
+itself the finding - it says the cause is somewhere the sections cannot
+see, and points at a sampling profiler instead of leaving the number
+looking like a measurement failure.
+
+Kept as one worst tick per second over the rolling minute, so the figure
+ages out with the window rather than being the worst since startup.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index 46575d737fe9bc169607e29a6a7b5c6861295338..f87d6ca5a3133b125d523aad94ad3ee3d0673097 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -165,6 +165,46 @@ public final class PerfCommand extends Command {
+             line(sender, "  Save", millisPerTick(VoidSoulProfiler.saveNanos.window(WINDOW), tickCount));
+         }
+ 
++        // VoidSoulSpigot start - what the single worst tick was actually made of.
++        // The averages above are useless for a spike: a 200 ms tick spread over a minute
++        // adds 0.17 ms to whichever section caused it. This is the same tick as "max".
++        double worst = VoidSoulProfiler.worstTickMillis(WINDOW);
++
++        if (worst >= 20.0D) {
++            sender.sendMessage(HEAD + "Worst tick " + LABEL
++                    + String.format("(%.1f ms, last %ds)", worst, windowSeconds()));
++
++            StringBuilder parts = new StringBuilder();
++            double accounted = 0.0D;
++
++            for (int section = 0; section < VoidSoulProfiler.SECTION_COUNT; section++) {
++                double cost = VoidSoulProfiler.worstTickSectionMillis(WINDOW, section);
++                accounted += cost;
++
++                if (cost >= 0.5D) {
++                    if (parts.length() > 0) parts.append(LABEL).append(", ");
++                    parts.append(VALUE).append(VoidSoulProfiler.SECTION_NAMES[section])
++                            .append(' ').append(String.format("%.1f", cost));
++                }
++            }
++
++            double unaccounted = worst - accounted;
++
++            if (parts.length() > 0) {
++                line(sender, "  Spent in", parts.toString());
++            }
++
++            // Naming the gap matters: the sections do not cover the network tick, the player
++            // list, or a plugin running inside a Bukkit event, so a large remainder is itself
++            // the finding rather than a measurement failure.
++            if (unaccounted >= 1.0D) {
++                line(sender, "  Unaccounted", String.format("%.1f ms", unaccounted) + LABEL
++                        + (accounted < worst * 0.25D
++                        ? "  (not in any measured section - try spark's profiler)" : ""));
++            }
++        }
++        // VoidSoulSpigot end
++
+         long loaded = 0L;
+         long queued = 0L;
+         long syncLoads = 0L;
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index a3e04d438dc9e021e6f3ea0b698ed8a9df5be5ac..d435599ce2313d10adfe7ef091b94261cec43efe 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -65,6 +65,91 @@ public final class VoidSoulProfiler {
+         }
+     }
+ 
++    // --- worst tick breakdown -----------------------------------------------------------
++    // Averages cannot find a spike. A single 200 ms tick spread across a minute of ticks
++    // adds 0.17 ms to whichever section caused it, which is indistinguishable from noise -
++    // so the section totals above can say where a spike was *not*, and never where it was.
++    // These record what each section cost on the single worst tick of every second, which
++    // is the question actually being asked when a server stutters once a minute.
++
++    public static final int SECTION_WORLDS = 0;
++    public static final int SECTION_ENTITIES = 1;
++    public static final int SECTION_TRACKER = 2;
++    public static final int SECTION_CHUNK_SEND = 3;
++    public static final int SECTION_CHUNK_LOAD = 4;
++    public static final int SECTION_SCHEDULER = 5;
++    public static final int SECTION_SAVE = 6;
++    public static final int SECTION_COUNT = 7;
++
++    public static final String[] SECTION_NAMES = {
++            "worlds", "entities", "tracker", "chunk send", "chunk load", "scheduler", "save"
++    };
++
++    /** What each section has cost so far on the tick being processed. */
++    private static final long[] currentTick = new long[SECTION_COUNT];
++
++    /** Worst tick seen in each of the last WINDOW_SECONDS seconds, and its breakdown. */
++    private static final long[] worstDuration = new long[WINDOW_SECONDS];
++    private static final long[][] worstBreakdown = new long[WINDOW_SECONDS][SECTION_COUNT];
++    private static int worstIndex;
++
++    /**
++     * As {@link #record(RollingCounter, long)}, and also attributes the time to a section of
++     * the tick currently being processed.
++     *
++     * @param section one of the SECTION_ constants
++     */
++    public static void record(RollingCounter counter, long start, int section) {
++        if (start == 0L) {
++            return;
++        }
++
++        long elapsed = System.nanoTime() - start;
++        counter.add(elapsed);
++
++        if (section >= 0 && section < SECTION_COUNT) {
++            currentTick[section] += elapsed;
++        }
++    }
++
++    /** Attributes time to the current tick without a rolling counter of its own. */
++    public static void recordSection(int section, long nanos) {
++        if (section >= 0 && section < SECTION_COUNT) {
++            currentTick[section] += nanos;
++        }
++    }
++
++    /** The worst tick of the last {@code seconds} seconds, in milliseconds, or 0. */
++    public static double worstTickMillis(int seconds) {
++        return worstOf(seconds, -1) / 1_000_000.0D;
++    }
++
++    /** What {@code section} cost on that worst tick, in milliseconds. */
++    public static double worstTickSectionMillis(int seconds, int section) {
++        return worstOf(seconds, section) / 1_000_000.0D;
++    }
++
++    private static long worstOf(int seconds, int section) {
++        int n = Math.min(Math.max(1, seconds), WINDOW_SECONDS);
++        long best = 0L;
++        int bestAt = -1;
++
++        for (int i = 0; i < n; i++) {
++            int at = Math.floorMod(worstIndex - 1 - i, WINDOW_SECONDS);
++
++            if (worstDuration[at] > best) {
++                best = worstDuration[at];
++                bestAt = at;
++            }
++        }
++
++        if (bestAt < 0) {
++            return 0L;
++        }
++
++        return section < 0 ? best : worstBreakdown[bestAt][section];
++    }
++
+     // --- global sections ----------------------------------------------------------------
+ 
+     /** Time spent draining the main thread task queue and the Bukkit scheduler. */
+@@ -126,12 +211,25 @@ public final class VoidSoulProfiler {
+             tickFilled++;
+         }
+ 
++        // VoidSoulSpigot - keep the worst tick of the current second, with its breakdown
++        if (durationNanos > worstDuration[worstIndex]) {
++            worstDuration[worstIndex] = durationNanos;
++            System.arraycopy(currentTick, 0, worstBreakdown[worstIndex], 0, SECTION_COUNT);
++        }
++
++        java.util.Arrays.fill(currentTick, 0L);
++
+         long now = System.nanoTime();
+ 
+         if (now - lastRollNanos >= 1_000_000_000L) {
+             lastRollNanos = now;
+             sampleGarbageCollection();
+ 
++            // Move to the next second's slot and clear whatever it held a minute ago.
++            worstIndex = (worstIndex + 1) % WINDOW_SECONDS;
++            worstDuration[worstIndex] = 0L;
++            java.util.Arrays.fill(worstBreakdown[worstIndex], 0L);
++
+             for (RollingCounter counter : COUNTERS) {
+                 counter.roll();
+             }
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 3182be6b7af22f569f27ea2cd460dbf4de703305..353abb40af76ccbf41a44f7cf6e970433a877cbc 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -149,6 +149,8 @@ public class ChunkProviderServer implements IChunkProvider {
+                 chunk = ChunkIOExecutor.syncChunkLoad(world, loader, this, i, j);
+                 long voidsoulElapsed = System.nanoTime() - voidsoulStart;
+                 this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++                com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                        com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_CHUNK_LOAD, voidsoulElapsed);
+                 com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, false);
+                 // VoidSoulSpigot end
+             }
+@@ -234,6 +236,8 @@ public class ChunkProviderServer implements IChunkProvider {
+             // VoidSoulSpigot start - internal profiler: this whole branch blocked the tick
+             long voidsoulElapsed = System.nanoTime() - voidsoulStart;
+             this.world.voidsoulStats.chunkLoadNanos.add(voidsoulElapsed);
++            com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                    com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_CHUNK_LOAD, voidsoulElapsed);
+             com.voidsoul.spigot.perf.ChunkLoadTracker.record(voidsoulElapsed, voidsoulGenerated);
+             // VoidSoulSpigot end
+         }
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 7e86c09f19beacac8fa15dcafa88d8fd50215e54..90d0dce9d202c4c8dfcdfd28339a92424799d4d5 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -335,7 +335,7 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+                 }
+             }
+ 
+-            com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.chunkSendNanos, voidsoulSendStart); // VoidSoulSpigot - internal profiler
++            com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.chunkSendNanos, voidsoulSendStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_CHUNK_SEND); // VoidSoulSpigot - internal profiler
+         }
+ 
+         Entity entity = this.C();
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 0cd691e69d058171671d3a44c56ca1f161f17795..c27c487a2a019fb86459305e09b0acfe3f7af00c 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -798,7 +798,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+             // Spigot End
+             this.methodProfiler.b();
+             SpigotTimings.worldSaveTimer.stopTiming(); // Spigot
+-            com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.saveNanos, voidsoulSaveStart); // VoidSoulSpigot - internal profiler
++            com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.saveNanos, voidsoulSaveStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_SAVE); // VoidSoulSpigot - internal profiler
+         }
+ 
+         this.methodProfiler.a("tallying");
+@@ -855,7 +855,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+             processQueue.remove().run();
+         }
+         SpigotTimings.processQueueTimer.stopTiming(); // Spigot
+-        com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.schedulerNanos, voidsoulSchedulerStart); // VoidSoulSpigot - internal profiler
++        com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.schedulerNanos, voidsoulSchedulerStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_SCHEDULER); // VoidSoulSpigot - internal profiler
+ 
+         SpigotTimings.chunkIOTickTimer.startTiming(); // Spigot
+         org.bukkit.craftbukkit.chunkio.ChunkIOExecutor.tick();
+@@ -912,7 +912,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+                     worldserver.timings.doTick.startTiming(); // Spigot
+                     worldserver.doTick();
+                     worldserver.timings.doTick.stopTiming(); // Spigot
+-                    com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.worldNanos, voidsoulSectionStart); // VoidSoulSpigot - internal profiler
++                    com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.worldNanos, voidsoulSectionStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_WORLDS); // VoidSoulSpigot - internal profiler
+                 } catch (Throwable throwable) {
+                     // Spigot Start
+                     try {
+@@ -931,7 +931,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+                     worldserver.timings.tickEntities.startTiming(); // Spigot
+                     worldserver.tickEntities();
+                     worldserver.timings.tickEntities.stopTiming(); // Spigot
+-                    com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.entityNanos, voidsoulSectionStart); // VoidSoulSpigot - internal profiler
++                    com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.entityNanos, voidsoulSectionStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_ENTITIES); // VoidSoulSpigot - internal profiler
+                 } catch (Throwable throwable1) {
+                     // Spigot Start
+                     try {
+@@ -985,7 +985,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+                 }
+                 // PandaSpigot end
+                 worldserver.timings.tracker.stopTiming(); // Spigot
+-                com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.trackerNanos, voidsoulSectionStart); // VoidSoulSpigot - internal profiler
++                com.voidsoul.spigot.perf.VoidSoulProfiler.record(worldserver.voidsoulStats.trackerNanos, voidsoulSectionStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_TRACKER); // VoidSoulSpigot - internal profiler
+                 this.methodProfiler.b();
+                 this.methodProfiler.b();
+                 worldserver.explosionDensityCache.clear(); // PaperSpigot - Optimize explosions
