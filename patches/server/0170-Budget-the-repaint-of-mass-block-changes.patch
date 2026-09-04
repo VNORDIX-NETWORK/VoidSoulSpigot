@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 22:39:25 -0500
+Subject: [PATCH] Budget the repaint of mass block changes
+
+Reported symptom: a mine reset took heap usage from around 900 MB to
+2400 MB, while the same reset on another 1.8 fork stayed flat and filled
+the mine in visibly rather than all at once. A schematic paste behaved
+the same way.
+
+That is not a leak, it is a burst of garbage, and the mechanism is the
+dirty chunk flush. Past 64 changed blocks in a chunk, PlayerChunk stops
+recording individual positions and instead accumulates a section bitmask,
+and the flush then sends PacketPlayOutMapChunk for every section that
+changed. A reset touching the full height of a chunk is therefore a
+near-complete chunk packet - and because that packet is not
+groundUpContinuous, it misses PaperSpigot's ChunkMap cache entirely and
+allocates a fresh array every time. flush() drained the entire dirty
+queue every tick, so every chunk a reset touched was rebuilt, serialised
+and compressed inside one tick, once per watching player. A hundred
+chunks with ten players nearby is on the order of 170 MB of short-lived
+garbage in a single tick.
+
+chunks.dirtyFlush.maxBytesPerTick, default 2 MB, spreads that over the
+following ticks. The cost is priced before the packet is built, from the
+chunk's section count and the number of players who will receive it, so
+a chunk that gets held back costs nothing to skip. Only the section
+resend is priced: a single block change is a few bytes and a multi-block
+change is bounded by 63 of them, so both are waved through.
+
+Nothing is lost, only delayed - a chunk that waits keeps its dirty state
+and is sent from whatever it looks like when its turn comes, which is if
+anything more correct. One chunk always goes through per tick, so a
+single very large chunk cannot wedge the queue, and 0 restores the old
+all-at-once behaviour.
+
+/vs perf chunks reports how many ticks a world spread repaints over, so
+the budget can be seen working rather than assumed.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index a203c7c037af18b1258366d5222b1ee3090dedff..572e8affa717491da345b0a32e14e625da234a68 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -191,6 +191,37 @@ public class VoidSoulWorldConfig {
+             public double directionalBias = 0.35D;
+         }
+ 
++        @Comment("How much chunk data mass block changes may repaint per tick.")
++        public DirtyFlushConfig dirtyFlush = new DirtyFlushConfig();
++
++        @ConfigSerializable
++        public static class DirtyFlushConfig {
++            @Comment("Maximum bytes of chunk data sent per tick to repaint blocks that\n" +
++                    "changed, counted across every player who receives them.\n" +
++                    "\n" +
++                    "This is the setting for mine resets and schematic pastes. Once more than\n" +
++                    "64 blocks change in a chunk, the server stops tracking individual\n" +
++                    "positions and resends whole chunk sections instead - so a reset that\n" +
++                    "touches the full height of a chunk costs a near-complete chunk packet,\n" +
++                    "for every player watching. Without a limit, every chunk a reset touched\n" +
++                    "is rebuilt, serialised and compressed inside a single tick: a hundred\n" +
++                    "chunks with ten players nearby is on the order of 170 MB of short-lived\n" +
++                    "garbage in one tick, which is what sends heap usage climbing by a\n" +
++                    "gigabyte or more until the collector catches up.\n" +
++                    "\n" +
++                    "With a budget the same work is spread over the following ticks. The mine\n" +
++                    "visibly fills in over a fraction of a second instead of appearing at\n" +
++                    "once, and the memory spike goes away. Nothing is ever lost: a chunk that\n" +
++                    "waits is sent from its state at the moment it is finally sent.\n" +
++                    "\n" +
++                    "At the default of 2 MB a hundred-chunk reset repaints in roughly half a\n" +
++                    "second. Lower it if resets still spike memory, raise it if they feel\n" +
++                    "sluggish. One chunk always goes through per tick, so a single very large\n" +
++                    "chunk can never wedge the queue. 0 disables the budget and restores the\n" +
++                    "old all-at-once behaviour.")
++            public int maxBytesPerTick = 2097152;
++        }
++
+         @Comment("Maximum number of sky light columns re-checked per chunk per tick.\n" +
+                 "\n" +
+                 "When a block changes at or above the highest block in its column, that\n" +
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index 4e0b3d44238cc2fa10b3f1d0bc08aa9b25834d2d..46575d737fe9bc169607e29a6a7b5c6861295338 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -254,6 +254,14 @@ public final class PerfCommand extends Command {
+             line(sender, "  Sent", sent + "" + LABEL + " chunks, " + VALUE
+                     + bytes(stats.chunkBytesSent.window(WINDOW)) + LABEL + ", deferred "
+                     + VALUE + stats.chunkSendsDeferred.window(WINDOW));
++
++            // VoidSoulSpigot - mine resets and schematic pastes show up here
++            long resendsDeferred = stats.chunkResendsDeferred.window(WINDOW);
++
++            if (resendsDeferred > 0L) {
++                line(sender, "  Repaints", "spread over " + resendsDeferred + LABEL
++                        + " ticks (mass block changes budgeted)");
++            }
+         }
+ 
+         footer(sender);
+diff --git a/src/main/java/com/voidsoul/spigot/perf/WorldPerfStats.java b/src/main/java/com/voidsoul/spigot/perf/WorldPerfStats.java
+index 1b88ccdbfdd2614142b0a5ebaa653987cca89825..233ba22d2ad771ab8c4922d4334740e28df5af8a 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/WorldPerfStats.java
++++ b/src/main/java/com/voidsoul/spigot/perf/WorldPerfStats.java
+@@ -40,6 +40,12 @@ public final class WorldPerfStats {
+     /** Chunk sends held back because the per-tick budget was already spent. */
+     public final RollingCounter chunkSendsDeferred = VoidSoulProfiler.counter();
+ 
++    /**
++     * Ticks on which the repaint of mass block changes ran out of budget and left chunks
++     * queued. Rises during mine resets and schematic pastes, which is the point.
++     */
++    public final RollingCounter chunkResendsDeferred = VoidSoulProfiler.counter();
++
+     // --- ticking ------------------------------------------------------------------------
+ 
+     /** Time in {@code WorldServer.doTick()} - weather, block ticks, tile entities. */
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index 796743421aac5c74ed48994845d39f53423e832e..4d581920f7fd5871528c85f8ad3d1870a0bd9e21 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -86,6 +86,33 @@ public class Chunk {
+ 
+         return PacketPlayOutMapChunk.a(nonEmptySections, !this.world.worldProvider.o(), true);
+     }
++
++    /**
++     * Size of a partial chunk packet carrying only the sections in {@code primaryBitMask}.
++     * <p>
++     * This is the packet a mass block change turns into: past 64 changed blocks in a chunk,
++     * the server stops tracking individual positions and resends whole sections instead. A
++     * mine reset that touches the full height of a chunk therefore costs a near-complete
++     * chunk packet, per watching player - which is why the flush that sends them needs a
++     * budget, and why that budget needs the size before the packet is built.
++     *
++     * @param primaryBitMask       which sections are included
++     * @param groundUpContinuous   whether biome data rides along, as for a full send
++     */
++    public int getChunkMapSize(int primaryBitMask, boolean groundUpContinuous) {
++        int sections = 0;
++
++        for (int i = 0; i < this.sections.length; ++i) {
++            ChunkSection section = this.sections[i];
++
++            if (section != null && (primaryBitMask & (1 << i)) != 0
++                    && (!groundUpContinuous || !section.a())) {
++                ++sections;
++            }
++        }
++
++        return PacketPlayOutMapChunk.a(sections, !this.world.worldProvider.o(), groundUpContinuous);
++    }
+     // VoidSoulSpigot end
+ 
+     public PacketPlayOutMapChunk.ChunkMap getChunkMap(boolean groundUpContinuous, int primaryBitMask) {
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index fd09eb6f58cdde1a33efa883d16587eb2bde465b..f5f30b662592b53666dd58b5ac2e9cfcebb5003a 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -94,13 +94,36 @@ public class PlayerChunkMap {
+                 playerchunkmap_playerchunk.a();
+             }
+         } else {
++            // VoidSoulSpigot start - budget the repaint of mass block changes.
++            //
++            // A mine reset or schematic paste dirties every chunk it touched, and past 64
++            // changed blocks in a chunk the flush below resends whole sections rather than
++            // individual positions. Draining the whole queue in one tick therefore rebuilds,
++            // serialises and compresses a near-complete chunk packet per touched chunk per
++            // watching player, all inside that tick - hundreds of megabytes of short-lived
++            // garbage, and the heap climbing by a gigabyte before the collector catches up.
++            //
++            // With a budget the same packets go out over the following ticks instead. A
++            // chunk left queued keeps its dirty state and is sent from whatever it looks
++            // like when its turn comes, so nothing is lost, only delayed.
++            int budget = this.world.voidsoulConfig.chunks.dirtyFlush.maxBytesPerTick;
++            int spent = 0;
++
+             java.util.Iterator iterator = this.e.iterator();
+             while (iterator.hasNext()) {
+                 playerchunkmap_playerchunk = (PlayerChunk) iterator.next();
++
++                if (budget > 0 && spent > 0 && spent + playerchunkmap_playerchunk.voidsoulResendCost() > budget) {
++                    this.world.voidsoulStats.chunkResendsDeferred.increment();
++                    break; // the rest keep their dirty state and go out next tick
++                }
++
++                spent += playerchunkmap_playerchunk.voidsoulResendCost();
+                 playerchunkmap_playerchunk.b();
+                 iterator.remove();
+                 // CraftBukkit end
+             }
++            // VoidSoulSpigot end
+         }
+ 
+         // this.e.clear(); //CraftBukkit - Removals are already covered
+@@ -533,6 +556,30 @@ public class PlayerChunkMap {
+ 
+         }
+ 
++        // VoidSoulSpigot start - what flushing this chunk is about to cost
++        /**
++         * Bytes this chunk's pending repaint will produce, counted across every player who
++         * will receive it.
++         * <p>
++         * Only the section resend is worth pricing. A single block change is a handful of
++         * bytes and a multi-block change is bounded by 63 of them, so both are waved through;
++         * what needs a budget is the 64-and-over case, which sends whole chunk sections.
++         */
++        int voidsoulResendCost() {
++            if (this.dirtyCount != 64) {
++                return 0;
++            }
++
++            Chunk chunk = PlayerChunkMap.this.world.getChunkIfLoaded(this.location.x, this.location.z);
++
++            if (chunk == null) {
++                return 0;
++            }
++
++            return chunk.getChunkMapSize(this.f, false) * Math.max(1, this.b.size());
++        }
++        // VoidSoulSpigot end
++
+         public void b() {
+             if (this.dirtyCount != 0) {
+                 int i;
