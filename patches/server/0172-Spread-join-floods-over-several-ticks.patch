@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 23:01:53 -0500
+Subject: [PATCH] Spread join floods over several ticks
+
+Completing a login reads player data, enters the world, starts entity
+tracking and runs every plugin's PlayerJoinEvent. With eighty plugins
+loaded that is real work, and a restart or a proxy reconnect delivers all
+of it in the same tick - so the first seconds after a restart, exactly
+when everyone is trying to get back in, are the seconds the server can
+least afford it.
+
+network.maxLoginsPerTick, default 3, caps how many finish per tick. That
+is still sixty players a second, so nobody waits noticeably; a login that
+does not get through is picked up on the next tick, well inside the 600
+tick login timeout. 0 removes the limit.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index aee0d5a42cd05cde6c68de23887243ecbf379d68..1bd776047270b81df09d19e0675f80caf8226057 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -360,6 +360,31 @@ public class VoidSoulConfig {
+         return Math.max(0, config.metrics.serviceId);
+     }
+ 
++    /** @return logins allowed per tick, 0 for no limit. Safe before the config loads. */
++    public static int getMaxLoginsPerTick() {
++        return config == null || config.network == null ? 0 : Math.max(0, config.network.maxLoginsPerTick);
++    }
++
++    @Comment("Connection handling.")
++    public NetworkConfig network = new NetworkConfig();
++
++    @ConfigSerializable
++    public static class NetworkConfig {
++        @Comment("How many players may finish joining in a single tick.\n" +
++                "\n" +
++                "Completing a login is expensive: player data is read, the world is entered,\n" +
++                "the entity starts being tracked, and every plugin's PlayerJoinEvent runs. On\n" +
++                "a server with eighty plugins that is real work, and a restart or a proxy\n" +
++                "reconnect delivers all of it at once - so the first seconds back up, exactly\n" +
++                "when everyone is trying to reconnect, are the seconds the server can least\n" +
++                "afford it.\n" +
++                "\n" +
++                "At 3 per tick the server still admits sixty players a second, so nobody\n" +
++                "waits noticeably, and the work is spread instead of arriving in one lump.\n" +
++                "0 removes the limit.")
++        public int maxLoginsPerTick = 3;
++    }
++
+     @Comment("Tweaks to the server's own commands.")
+     public CommandsConfig commands = new CommandsConfig();
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/net/LoginThrottle.java b/src/main/java/com/voidsoul/spigot/net/LoginThrottle.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3291c1f7d4611b6f5ec18298657279d9bfab1d5
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/net/LoginThrottle.java
+@@ -0,0 +1,43 @@
++package com.voidsoul.spigot.net;
++
++import com.voidsoul.spigot.config.VoidSoulConfig;
++
++/**
++ * Caps how many players may complete the join process in one tick.
++ * <p>
++ * Finishing a login is not cheap: player data is read, the world is entered, the entity is
++ * tracked, and every plugin's PlayerJoinEvent runs. On a server with eighty plugins that is
++ * a substantial amount of work, and a restart or a proxy reconnect delivers it all at once -
++ * so the first seconds after a restart, exactly when everyone is trying to get back in, are
++ * the seconds the server can least afford it.
++ * <p>
++ * Spreading the same joins over a few ticks costs the last player in the queue a fraction of
++ * a second and keeps the server responsive for everyone already inside.
++ * <p>
++ * Main thread only; logins are completed from the server tick.
++ */
++public final class LoginThrottle {
++    private static int remaining;
++
++    private LoginThrottle() {
++    }
++
++    /** Refills the allowance. Called once at the top of the server tick. */
++    public static void startTick() {
++        remaining = VoidSoulConfig.getMaxLoginsPerTick();
++    }
++
++    /**
++     * @return whether another login may be completed this tick. Always true when no limit is
++     *         configured.
++     */
++    public static boolean tryAcquire() {
++        if (remaining <= 0) {
++            // Zero means unlimited, so it is distinguished from having run out.
++            return VoidSoulConfig.getMaxLoginsPerTick() <= 0;
++        }
++
++        remaining--;
++        return true;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/LoginListener.java b/src/main/java/net/minecraft/server/LoginListener.java
+index db892152d785b2f1badd12c7062221220961821b..edf04d6e2dd017b92fdf3eb1f044be718916b401 100644
+--- a/src/main/java/net/minecraft/server/LoginListener.java
++++ b/src/main/java/net/minecraft/server/LoginListener.java
+@@ -56,6 +56,20 @@ public class LoginListener implements PacketLoginInListener, IUpdatePlayerListBo
+     }
+ 
+     public void c() {
++        // VoidSoulSpigot start - spread join floods over several ticks. Both branches below
++        // finish a login, which reads player data, enters the world and runs every plugin's
++        // PlayerJoinEvent; a restart delivers all of them in the same tick otherwise. A
++        // login that waits is simply picked up on the next tick, well inside the 600 tick
++        // login timeout counted below.
++        if (this.g == LoginListener.EnumProtocolState.READY_TO_ACCEPT
++                || this.g == LoginListener.EnumProtocolState.e) {
++            if (!com.voidsoul.spigot.net.LoginThrottle.tryAcquire()) {
++                this.h++;
++                return;
++            }
++        }
++        // VoidSoulSpigot end
++
+         if (this.g == LoginListener.EnumProtocolState.READY_TO_ACCEPT) {
+             this.b();
+         } else if (this.g == LoginListener.EnumProtocolState.e) {
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index df3b009578972b18a28ccf5c0a97551fb4d6d825..0cd691e69d058171671d3a44c56ca1f161f17795 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -757,6 +757,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+         com.voidsoul.spigot.chunk.ChunkSendBudget.startTick(); // VoidSoulSpigot - chunk send budget
+         com.voidsoul.spigot.chunk.SmartViewDistance.tick(this); // VoidSoulSpigot - smart view distance
+         com.voidsoul.spigot.adaptive.AdaptivePerformance.tick(); // VoidSoulSpigot - adaptive performance
++        com.voidsoul.spigot.net.LoginThrottle.startTick(); // VoidSoulSpigot - spread join floods
+         if (this.T) {
+             this.T = false;
+             this.methodProfiler.a = true;

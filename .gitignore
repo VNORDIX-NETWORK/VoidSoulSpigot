@@ -16,3 +16,6 @@ build/
 
 paperclip.jar
 VoidSoulSpigot-paperclip.jar
+
+# Imanity reference configs - contains a paid license key, never commit
+/imanity/

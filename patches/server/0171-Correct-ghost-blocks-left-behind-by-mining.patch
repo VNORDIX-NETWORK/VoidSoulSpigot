@@ -1,0 +1,272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 23:00:24 -0500
+Subject: [PATCH] Correct ghost blocks left behind by mining
+
+A 1.8 client removes a block the moment it believes it broke it, without
+waiting to be told. Usually the server agrees. On a prison server it
+often does not: the mine regenerates under the player mid-swing, a plugin
+puts the block back, or the acknowledgement is lost - and the client is
+left showing air where the server has stone, so the player swings at
+nothing until something else forces a chunk update.
+
+Blocks a player digs are now remembered and the server's actual view of
+them re-sent shortly afterwards.
+
+The delay is the whole design. Correcting immediately is worse than the
+bug, because the packet lands while the client is still legitimately
+predicting the break and the block visibly flickers back before breaking
+again. A disagreement only means something once a round trip has passed,
+so the delay scales with ping: minDelayTicks plus ticksPerHundredMsPing
+per 100 ms, capped at maxDelayTicks.
+
+  mining.ghostBlockFix.enabled                on by default
+  mining.ghostBlockFix.minDelayTicks          3
+  mining.ghostBlockFix.ticksPerHundredMsPing  2
+  mining.ghostBlockFix.maxDelayTicks          20
+  mining.ghostBlockFix.maxBlocksPerResync     32
+
+Batching falls out of it: a player mining faster than their delay has
+several positions corrected in one pass rather than one packet per block.
+Past the cap the oldest entries are dropped rather than the newest, since
+ghosts pile up at the head of a tunnel and not behind it.
+
+The per-player state is allocated on the first dig, so players who never
+break a block never pay for it.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+index 572e8affa717491da345b0a32e14e625da234a68..ab34a37dd15ca37eb88eb1a3fe44041af00a49e0 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulWorldConfig.java
+@@ -63,6 +63,54 @@ public class VoidSoulWorldConfig {
+         }
+     }
+ 
++    @Comment("Block breaking behaviour.")
++    public MiningConfig mining = new MiningConfig();
++
++    @ConfigSerializable
++    public static class MiningConfig {
++        @Comment("Correct ghost blocks left behind by mining.")
++        public GhostBlockFixConfig ghostBlockFix = new GhostBlockFixConfig();
++
++        @ConfigSerializable
++        public static class GhostBlockFixConfig {
++            @Comment("Re-send the server's view of blocks a player has just dug.\n" +
++                    "\n" +
++                    "A 1.8 client removes a block the moment it thinks it broke it, without\n" +
++                    "waiting to be told. Usually the server agrees. On a prison server it\n" +
++                    "often does not: the mine regenerates under the player mid-swing, a plugin\n" +
++                    "puts the block back, or the acknowledgement is lost - and the client is\n" +
++                    "then showing air where the server has stone. The player swings at\n" +
++                    "nothing until something else forces a chunk update.\n" +
++                    "\n" +
++                    "This re-sends what the server actually has, shortly after the dig.")
++            public boolean enabled = true;
++
++            @Comment("Minimum ticks to wait after a dig before correcting it.\n" +
++                    "\n" +
++                    "Correcting immediately is worse than the bug: the packet arrives while\n" +
++                    "the client is still legitimately predicting the break, so the block\n" +
++                    "visibly flickers back before breaking again. Never set this to 0.")
++            public int minDelayTicks = 3;
++
++            @Comment("Extra ticks of delay per 100 ms of the player's ping.\n" +
++                    "\n" +
++                    "A disagreement only means something once a round trip has passed, and a\n" +
++                    "round trip at 200 ms is four ticks. 2 tracks ping honestly; raise it if\n" +
++                    "players on bad connections report blocks flickering, lower it if ghosts\n" +
++                    "take too long to clear.")
++            public int ticksPerHundredMsPing = 2;
++
++            @Comment("Ceiling on the delay, so a player with a terrible connection still gets\n" +
++                    "corrected eventually.")
++            public int maxDelayTicks = 20;
++
++            @Comment("Most blocks tracked per player between corrections. A player mining\n" +
++                    "faster than the delay drops the oldest entries first, since ghosts pile\n" +
++                    "up at the head of the tunnel rather than behind it.")
++            public int maxBlocksPerResync = 32;
++        }
++    }
++
+     @Comment("Projectile behaviour settings.")
+     public ProjectilesConfig projectiles;
+ 
+diff --git a/src/main/java/com/voidsoul/spigot/mining/MiningResync.java b/src/main/java/com/voidsoul/spigot/mining/MiningResync.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac9216ab5bf2e03376a279d78d11e5335d4728c0
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/mining/MiningResync.java
+@@ -0,0 +1,119 @@
++package com.voidsoul.spigot.mining;
++
++import com.voidsoul.spigot.config.VoidSoulWorldConfig;
++import net.minecraft.server.BlockPosition;
++import net.minecraft.server.EntityPlayer;
++import net.minecraft.server.PacketPlayOutBlockChange;
++import net.minecraft.server.WorldServer;
++
++/**
++ * Re-sends the server's view of the blocks a player has just dug, so a ghost block corrects
++ * itself in a fraction of a second instead of lasting until the chunk is reloaded.
++ * <p>
++ * A 1.8 client removes a block the instant it believes it broke it, without waiting to be
++ * told. Usually the server agrees and nothing is noticed. On a prison server it often does
++ * not: the mine regenerates underneath the player mid-swing, a plugin puts the block back,
++ * or the acknowledgement is simply lost. The client is then showing air where the server has
++ * stone, and the player mines into nothing until something else forces a chunk update.
++ * <p>
++ * The correction has to wait. Sending the server's truth immediately would arrive while the
++ * client is still legitimately predicting, and the block would visibly flicker back before
++ * breaking again - which looks worse than the bug. So the delay scales with the player's
++ * ping: it must be at least one round trip before a disagreement means anything.
++ * <p>
++ * Main thread only. One instance per player, created the first time they dig.
++ */
++public final class MiningResync {
++    /** Positions dug since the last resync, oldest first. */
++    private BlockPosition[] positions = new BlockPosition[16];
++    private int count;
++
++    /** Server tick the oldest pending position was dug on. */
++    private int oldestTick;
++
++    /**
++     * Records a block the player just tried to break.
++     *
++     * @param currentTick the server tick, used to age the batch
++     */
++    public void record(BlockPosition position, int currentTick, int max) {
++        if (position == null) {
++            return;
++        }
++
++        if (this.count == 0) {
++            this.oldestTick = currentTick;
++        }
++
++        // Past the cap the oldest entries are dropped rather than the newest: a player who
++        // is mining faster than the resync interval is producing ghosts at the head of their
++        // tunnel, not behind them.
++        if (this.count >= max) {
++            System.arraycopy(this.positions, 1, this.positions, 0, this.count - 1);
++            this.positions[this.count - 1] = position;
++            return;
++        }
++
++        if (this.count == this.positions.length) {
++            BlockPosition[] grown = new BlockPosition[Math.min(max, this.positions.length * 2)];
++            System.arraycopy(this.positions, 0, grown, 0, this.count);
++            this.positions = grown;
++        }
++
++        this.positions[this.count++] = position;
++    }
++
++    /**
++     * Flushes the batch once it has aged past the player's round trip.
++     *
++     * @param currentTick the server tick
++     */
++    public void tick(EntityPlayer player, int currentTick) {
++        if (this.count == 0) {
++            return;
++        }
++
++        VoidSoulWorldConfig.MiningConfig.GhostBlockFixConfig config =
++                player.world.voidsoulConfig.mining.ghostBlockFix;
++
++        if (!config.enabled) {
++            this.clear();
++            return;
++        }
++
++        if (currentTick - this.oldestTick < delayFor(player, config)) {
++            return;
++        }
++
++        WorldServer world = player.world instanceof WorldServer ? (WorldServer) player.world : null;
++
++        if (world != null) {
++            for (int i = 0; i < this.count; i++) {
++                player.playerConnection.sendPacket(new PacketPlayOutBlockChange(world, this.positions[i]));
++            }
++        }
++
++        this.clear();
++    }
++
++    /**
++     * How long to wait before treating a disagreement as real.
++     * <p>
++     * A round trip at 200 ms is four ticks, so correcting sooner than that would be
++     * correcting the client while its own prediction is still in flight.
++     */
++    private static int delayFor(EntityPlayer player, VoidSoulWorldConfig.MiningConfig.GhostBlockFixConfig config) {
++        int ping = Math.max(0, player.ping);
++        int delay = config.minDelayTicks + (ping * config.ticksPerHundredMsPing) / 100;
++
++        return Math.min(Math.max(1, config.maxDelayTicks), Math.max(1, delay));
++    }
++
++    private void clear() {
++        for (int i = 0; i < this.count; i++) {
++            this.positions[i] = null; // do not pin BlockPositions until the next batch
++        }
++
++        this.count = 0;
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 2c2967ecc8cb3ee2d768a2c4a9b55c36f380c81e..7e86c09f19beacac8fa15dcafa88d8fd50215e54 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -66,6 +66,7 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     // Spigot start
+     public boolean collidesWithEntities = true;
+     public int viewDistance; // PaperSpigot - Player view distance API
++    public com.voidsoul.spigot.mining.MiningResync voidsoulMining; // VoidSoulSpigot - ghost block fix, created on first dig
+     private int containerUpdateDelay; // PaperSpigot
+ 
+     @Override
+@@ -241,6 +242,11 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+             this.playerConnection.sendPacket(new PacketPlayOutEntityDestroy(aint));
+         }
+ 
++        // VoidSoulSpigot - correct any ghost blocks this player left behind while mining
++        if (this.voidsoulMining != null) {
++            this.voidsoulMining.tick(this, MinecraftServer.currentTick);
++        }
++
+         if (!this.chunkCoordIntPairQueue.isEmpty()) {
+             long voidsoulSendStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start(); // VoidSoulSpigot - internal profiler
+             long voidsoulBytes = 0L; // VoidSoulSpigot - internal profiler
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index 4988cb4de12d42eafba2e548cd61f739ffb70028..183ac5c16b62eae3d336cde8119905704c7fb8cf 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -686,6 +686,21 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+                     }
+                 }
+ 
++                // VoidSoulSpigot start - remember what was dug so a ghost block left by a
++                // mine reset or a lost acknowledgement corrects itself shortly after.
++                com.voidsoul.spigot.config.VoidSoulWorldConfig.MiningConfig.GhostBlockFixConfig voidsoulGhostFix =
++                        worldserver.voidsoulConfig.mining.ghostBlockFix;
++
++                if (voidsoulGhostFix.enabled) {
++                    if (this.player.voidsoulMining == null) {
++                        this.player.voidsoulMining = new com.voidsoul.spigot.mining.MiningResync();
++                    }
++
++                    this.player.voidsoulMining.record(blockposition, MinecraftServer.currentTick,
++                            Math.max(1, voidsoulGhostFix.maxBlocksPerResync));
++                }
++                // VoidSoulSpigot end
++
+                 return;
+             }
+ 
