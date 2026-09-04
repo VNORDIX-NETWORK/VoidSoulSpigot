@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 00:16:09 -0500
+Subject: [PATCH] Measure whole-chunk relights separately
+
+A mine reset showed up as 200 ms of "scheduler", which reads as plugin
+time and is only half true. Chunk.a() calls initLighting() - a relight of
+the entire chunk - for every block placed at or above the height map, so
+filling a chunk from air triggers it once per column. That runs inside
+whatever task is setting the blocks, so its cost is charged to the
+scheduler and looks like the plugin's own work.
+
+PaperSpigot's use-async-lighting does not cover this path; it only moves
+recheckGaps off the main thread.
+
+initLighting() is now timed into its own "lighting" section, so the next
+mine reset says how much of that 200 ms is the fork relighting and how
+much is genuinely the plugin. Two nanoTime calls around a method that
+already walks the whole chunk.
+
+No behaviour change - this only measures, so the decision about what to
+do next is made against a number instead of a guess.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index 465befe1c92de190fb33c091ab57e858e1dba6b2..4520ddbda236a0db72fd05d1f6ed16dd8efe7457 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -79,10 +79,11 @@ public final class VoidSoulProfiler {
+     public static final int SECTION_CHUNK_LOAD = 4;
+     public static final int SECTION_SCHEDULER = 5;
+     public static final int SECTION_SAVE = 6;
+-    public static final int SECTION_COUNT = 7;
++    public static final int SECTION_LIGHTING = 7;
++    public static final int SECTION_COUNT = 8;
+ 
+     public static final String[] SECTION_NAMES = {
+-            "worlds", "entities", "tracker", "chunk send", "chunk load", "scheduler", "save"
++            "worlds", "entities", "tracker", "chunk send", "chunk load", "scheduler", "save", "lighting"
+     };
+ 
+     /** What each section has cost so far on the tick being processed. */
+diff --git a/src/main/java/net/minecraft/server/Chunk.java b/src/main/java/net/minecraft/server/Chunk.java
+index 4d581920f7fd5871528c85f8ad3d1870a0bd9e21..e369714e13247f684256bc403484ac8c220bbc6f 100644
+--- a/src/main/java/net/minecraft/server/Chunk.java
++++ b/src/main/java/net/minecraft/server/Chunk.java
+@@ -269,6 +269,15 @@ public class Chunk {
+     }
+ 
+     public void initLighting() {
++        // VoidSoulSpigot start - this is a whole-chunk relight, and Chunk.a() calls it for
++        // every block placed at or above the height map. A mine reset filling a chunk from
++        // air therefore triggers it once per column, from inside whatever plugin task is
++        // setting the blocks - so it lands in the scheduler section and looks like plugin
++        // time. Measured separately so that can be seen rather than inferred.
++        long voidsoulLightStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start();
++
++        try {
++        // VoidSoulSpigot end
+         int i = this.g();
+ 
+         this.t = Integer.MAX_VALUE;
+@@ -325,6 +334,15 @@ public class Chunk {
+         }
+ 
+         this.q = true;
++        // VoidSoulSpigot start - see the note at the top of this method
++        } finally {
++            if (voidsoulLightStart != 0L) {
++                com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                        com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_LIGHTING,
++                        System.nanoTime() - voidsoulLightStart);
++            }
++        }
++        // VoidSoulSpigot end
+     }
+ 
+     private void d(int i, int j) {
