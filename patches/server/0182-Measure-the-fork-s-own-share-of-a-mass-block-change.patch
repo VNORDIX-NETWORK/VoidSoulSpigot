@@ -1,0 +1,259 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 14:58:37 -0500
+Subject: [PATCH] Measure the fork's own share of a mass block change
+
+A mine reset shows up as time in the scheduler, which reads as "a plugin"
+and is only half true: everything the server does in response to
+setTypeAndData - relights, height map updates, neighbour notifications,
+dirty flagging - runs inside the plugin's task and is charged to it. That
+split decides whether a 200 ms reset spike is worth attacking from the
+fork or belongs to the plugin's configuration, and it cannot be read from
+a production profile.
+
+/vs bench massfill [chunksPerSide] [height] does the block setting with
+no plugin involved and reports what the sections recorded, including how
+much of it was relighting. It fills a fixed area far from anything a
+server uses, measures, and then clears it again so repeated runs measure
+the same thing.
+
+Whatever a real reset costs beyond this figure is the plugin's, and the
+answer to it is the plugin's batch size rather than anything here.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java b/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f44ac2f81730f35b5dc658ce7b23181dcaf1f598
+--- /dev/null
++++ b/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java
+@@ -0,0 +1,126 @@
++package com.voidsoul.spigot.bench;
++
++import com.voidsoul.spigot.perf.VoidSoulProfiler;
++import net.minecraft.server.BlockPosition;
++import net.minecraft.server.Blocks;
++import net.minecraft.server.IBlockData;
++import net.minecraft.server.WorldServer;
++
++/**
++ * Measures what the server itself costs when a plugin fills a region with blocks.
++ * <p>
++ * A mine reset shows up in the profiler as time in the scheduler, which reads as "a plugin"
++ * and is only half true: everything the server does in response to setTypeAndData - relights,
++ * height map updates, neighbour notifications, dirty flagging - happens inside the plugin's
++ * task and is charged to it. Deciding whether that spike is worth attacking from the fork
++ * means knowing the split, and the split cannot be read from a production profile.
++ * <p>
++ * So this does the block setting itself, with no plugin involved, and reports what the
++ * sections recorded. Whatever it costs here is the fork's share of any mass block change of
++ * the same size.
++ * <p>
++ * It runs on the main thread and blocks for as long as it takes - that is the point.
++ */
++public final class MassFillBenchmark {
++    /**
++     * Where the test terrain goes. Far from anything a server actually uses, and fixed so
++     * repeated runs touch the same chunks rather than scattering test terrain around.
++     */
++    private static final int BASE_CHUNK = 60000;
++
++    private MassFillBenchmark() {
++    }
++
++    /** What one run measured. All times in milliseconds. */
++    public static final class Result {
++        public final int chunks;
++        public final int blocks;
++        public final double totalMillis;
++        public final double lightingMillis;
++        public final double worldMillis;
++
++        Result(int chunks, int blocks, double totalMillis, double lightingMillis, double worldMillis) {
++            this.chunks = chunks;
++            this.blocks = blocks;
++            this.totalMillis = totalMillis;
++            this.lightingMillis = lightingMillis;
++            this.worldMillis = worldMillis;
++        }
++
++        /** Share of the fill that was the server relighting chunks. */
++        public double lightingShare() {
++            return this.totalMillis <= 0.0D ? 0.0D : this.lightingMillis / this.totalMillis;
++        }
++    }
++
++    /**
++     * Fills a square of chunks with stone and measures it, then puts the area back to air.
++     *
++     * @param world  the world to build the test terrain in
++     * @param side   how many chunks on a side; 6 is 36 chunks, about a small mine
++     * @param height how many blocks tall each column is
++     */
++    public static Result run(WorldServer world, int side, int height) {
++        IBlockData stone = Blocks.STONE.getBlockData();
++        IBlockData air = Blocks.AIR.getBlockData();
++
++        // Load the area first, so the measurement is the block setting and not chunk I/O.
++        for (int cx = 0; cx < side; cx++) {
++            for (int cz = 0; cz < side; cz++) {
++                world.chunkProviderServer.getChunkAt(BASE_CHUNK + cx, BASE_CHUNK + cz);
++            }
++        }
++
++        long lightingBefore = VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING);
++        long worldBefore = VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_WORLDS);
++
++        int blocks = 0;
++        long start = System.nanoTime();
++
++        for (int cx = 0; cx < side; cx++) {
++            for (int cz = 0; cz < side; cz++) {
++                int originX = (BASE_CHUNK + cx) << 4;
++                int originZ = (BASE_CHUNK + cz) << 4;
++
++                for (int x = 0; x < 16; x++) {
++                    for (int z = 0; z < 16; z++) {
++                        for (int y = 1; y <= height; y++) {
++                            // Flag 2 is "notify clients"; nobody is within a thousand blocks
++                            // of here, so no packets are produced and what is measured is
++                            // the block change itself rather than the network.
++                            world.setTypeAndData(new BlockPosition(originX + x, y, originZ + z), stone, 2);
++                            blocks++;
++                        }
++                    }
++                }
++            }
++        }
++
++        double totalMillis = (System.nanoTime() - start) / 1_000_000.0D;
++        double lightingMillis =
++                (VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING) - lightingBefore)
++                        / 1_000_000.0D;
++        double worldMillis =
++                (VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_WORLDS) - worldBefore)
++                        / 1_000_000.0D;
++
++        // Put it back, so a second run measures the same thing as the first rather than
++        // filling already-solid chunks.
++        for (int cx = 0; cx < side; cx++) {
++            for (int cz = 0; cz < side; cz++) {
++                int originX = (BASE_CHUNK + cx) << 4;
++                int originZ = (BASE_CHUNK + cz) << 4;
++
++                for (int x = 0; x < 16; x++) {
++                    for (int z = 0; z < 16; z++) {
++                        for (int y = 1; y <= height; y++) {
++                            world.setTypeAndData(new BlockPosition(originX + x, y, originZ + z), air, 2);
++                        }
++                    }
++                }
++            }
++        }
++
++        return new Result(side * side, blocks, totalMillis, lightingMillis, worldMillis);
++    }
++}
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index d161d903a9daefd03ce1795b85ebd03bc85d775e..ca9321d470862e89daa80bd47b4c8d0e4b3a2734 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -1,5 +1,6 @@
+ package com.voidsoul.spigot.perf;
+ 
++import com.voidsoul.spigot.bench.MassFillBenchmark;
+ import com.voidsoul.spigot.bench.RegionCacheBenchmark;
+ import net.minecraft.server.MinecraftServer;
+ import net.minecraft.server.WorldServer;
+@@ -90,7 +91,7 @@ public final class PerfCommand extends Command {
+ 
+         // VoidSoulSpigot start - benchmarks
+         if (args.length == 2 && args[0].equalsIgnoreCase("bench")) {
+-            return partial(args[1], Collections.singletonList("regioncache"));
++            return partial(args[1], Arrays.asList("regioncache", "massfill"));
+         }
+         // VoidSoulSpigot end
+ 
+@@ -433,8 +434,16 @@ public final class PerfCommand extends Command {
+     // VoidSoulSpigot start - reproducible benchmarks
+     /** {@code /vs bench regioncache [files] [passes] [force]} */
+     private boolean bench(CommandSender sender, String[] args) {
++        // VoidSoulSpigot - measures what the fork itself costs during a mass block change,
++        // which is the number needed to decide whether a mine reset spike is worth
++        // attacking from here or belongs to the plugin doing the resetting.
++        if (args.length >= 2 && args[1].equalsIgnoreCase("massfill")) {
++            return this.massfill(sender, args);
++        }
++
+         if (args.length < 2 || !args[1].equalsIgnoreCase("regioncache")) {
+             sender.sendMessage(ChatColor.RED + "Usage: /vs bench regioncache [files] [passes]");
++            sender.sendMessage(ChatColor.RED + "       /vs bench massfill [chunksPerSide] [height]");
+             sender.sendMessage(LABEL + "Drives the region file cache against throwaway files so "
+                     + "its open and evict behaviour can be compared across builds. It blocks "
+                     + "the server while it runs.");
+@@ -483,6 +492,49 @@ public final class PerfCommand extends Command {
+         return true;
+     }
+ 
++    /** {@code /vs bench massfill [chunksPerSide] [height] [force]} */
++    private boolean massfill(CommandSender sender, String[] args) {
++        int side = parse(args, 2, 6, 1, 16);
++        int height = parse(args, 3, 64, 1, 200);
++        boolean force = args.length > 4 && args[4].equalsIgnoreCase("force");
++        int online = MinecraftServer.getServer().getPlayerList().getPlayerCount();
++
++        if (online > 0 && !force) {
++            sender.sendMessage(ChatColor.RED + "There are " + online + " players online and this "
++                    + "freezes the server while it runs. Use an empty server, or append "
++                    + ChatColor.WHITE + "force" + ChatColor.RED + ".");
++            return true;
++        }
++
++        WorldServer world = MinecraftServer.getServer().worlds.get(0);
++
++        sender.sendMessage(LABEL + "Filling " + (side * side) + " chunks, " + height
++                + " blocks tall, then clearing them...");
++
++        MassFillBenchmark.Result result;
++
++        try {
++            result = MassFillBenchmark.run(world, side, height);
++        } catch (Throwable throwable) {
++            sender.sendMessage(ChatColor.RED + "Benchmark failed: " + throwable);
++            MinecraftServer.LOGGER.warn("VoidSoul mass fill benchmark failed", throwable);
++            return true;
++        }
++
++        header(sender, "Mass block change benchmark");
++        line(sender, "Filled", result.chunks + "" + LABEL + " chunks, " + VALUE + result.blocks
++                + LABEL + " blocks in " + VALUE + String.format("%.0f ms", result.totalMillis));
++        line(sender, "Per block", String.format("%.1f us",
++                result.totalMillis * 1000.0D / Math.max(1, result.blocks)));
++        line(sender, "Relighting", String.format("%.0f ms", result.lightingMillis) + LABEL
++                + String.format("  (%.0f%% of the fill)", result.lightingShare() * 100.0D));
++        sender.sendMessage(LABEL + "This is the server's own share of a mass block change. "
++                + "Anything a mine reset costs beyond it belongs to the plugin doing the "
++                + "resetting, not to the fork.");
++        footer(sender);
++        return true;
++    }
++
+     private static int parse(String[] args, int index, int fallback, int min, int max) {
+         if (args.length <= index) {
+             return fallback;
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index e70e0c51a49979bc3250647244534a74bb178b1c..f00c5effa9cbfa2399cb50ba30195d9eda790136 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -153,6 +153,11 @@ public final class VoidSoulProfiler {
+         return inTick;
+     }
+ 
++    /** What a section has cost so far on the tick in progress, in nanoseconds. */
++    public static long currentTickSection(int section) {
++        return section >= 0 && section < SECTION_COUNT ? currentTick[section] : 0L;
++    }
++
+     /** Attributes time to the current tick without a rolling counter of its own. */
+     public static void recordSection(int section, long nanos) {
+         if (inTick && section >= 0 && section < SECTION_COUNT) {
