@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 00:04:09 -0500
+Subject: [PATCH] Name the plugin behind a scheduler spike
+
+The worst-tick breakdown could say a 215 ms tick was 200 ms of
+"scheduler", which narrows the cause to "a plugin" and stops there. On a
+server running eighty of them that is not an answer.
+
+Synchronous scheduler tasks are now charged to the plugin that owns them,
+and the worst tick of each second keeps whichever plugin spent the most
+on it. /vs perf reports it by name, and flags when that one plugin
+accounted for most of the tick.
+
+  Worst tick (215.5 ms, last 60s)
+    Spent in: worlds 13.6, entities 1.2, scheduler 200.6
+    Worst plugin: JetsPrisonMines 198.9 ms (most of the tick)
+
+The timing sits after the task's catch block, so a task that threw is
+still accounted for rather than vanishing from the total. Plugin entries
+are reused and zeroed each tick instead of being cleared, so a path that
+runs twenty times a second does not churn the map, and the whole thing is
+behind the same debug.profiler switch as the other section timers.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index f87d6ca5a3133b125d523aad94ad3ee3d0673097..05e3cae8c36f837604fc27e04455748107332892 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -194,6 +194,17 @@ public final class PerfCommand extends Command {
+                 line(sender, "  Spent in", parts.toString());
+             }
+ 
++            // "scheduler" only narrows a spike to "a plugin"; this names it.
++            String plugin = VoidSoulProfiler.worstTickPlugin(WINDOW);
++            double pluginMillis = VoidSoulProfiler.worstTickPluginMillis(WINDOW);
++
++            if (plugin != null && pluginMillis >= 1.0D) {
++                line(sender, "  Worst plugin", plugin + LABEL + " "
++                        + String.format("%.1f ms", pluginMillis)
++                        + (pluginMillis > worst * 0.5D
++                        ? ChatColor.YELLOW + "  (most of the tick)" : ""));
++            }
++
+             // Naming the gap matters: the sections do not cover the network tick, the player
+             // list, or a plugin running inside a Bukkit event, so a large remainder is itself
+             // the finding rather than a measurement failure.
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index 6ad29f5c08523ead19d8c7a198d9869b51dc39e5..465befe1c92de190fb33c091ab57e858e1dba6b2 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -88,6 +88,29 @@ public final class VoidSoulProfiler {
+     /** What each section has cost so far on the tick being processed. */
+     private static final long[] currentTick = new long[SECTION_COUNT];
+ 
++    // Knowing a spike was "the scheduler" only narrows it to "a plugin". These carry the
++    // name, which is the difference between a diagnosis and a shrug.
++    private static final java.util.Map<String, long[]> pluginNanos =
++            new java.util.HashMap<String, long[]>();
++    private static final String[] worstPlugin = new String[WINDOW_SECONDS];
++    private static final long[] worstPluginNanos = new long[WINDOW_SECONDS];
++
++    /** Charges a synchronous scheduler task to the plugin that owns it. */
++    public static void recordPluginTask(String plugin, long nanos) {
++        if (!timings || plugin == null) {
++            return;
++        }
++
++        long[] slot = pluginNanos.get(plugin);
++
++        if (slot == null) {
++            slot = new long[1];
++            pluginNanos.put(plugin, slot);
++        }
++
++        slot[0] += nanos;
++    }
++
+     /** Worst tick seen in each of the last WINDOW_SECONDS seconds, and its breakdown. */
+     private static final long[] worstDuration = new long[WINDOW_SECONDS];
+     private static final long[][] worstBreakdown = new long[WINDOW_SECONDS][SECTION_COUNT];
+@@ -130,6 +153,11 @@ public final class VoidSoulProfiler {
+     }
+ 
+     private static long worstOf(int seconds, int section) {
++        int at = worstIndexOf(seconds);
++        return at < 0 ? 0L : (section < 0 ? worstDuration[at] : worstBreakdown[at][section]);
++    }
++
++    private static int worstIndexOf(int seconds) {
+         int n = Math.min(Math.max(1, seconds), WINDOW_SECONDS);
+         long best = 0L;
+         int bestAt = -1;
+@@ -143,11 +171,19 @@ public final class VoidSoulProfiler {
+             }
+         }
+ 
+-        if (bestAt < 0) {
+-            return 0L;
+-        }
++        return bestAt;
++    }
+ 
+-        return section < 0 ? best : worstBreakdown[bestAt][section];
++    /** The plugin that spent most in the scheduler on the worst tick, or null. */
++    public static String worstTickPlugin(int seconds) {
++        int at = worstIndexOf(seconds);
++        return at < 0 ? null : worstPlugin[at];
++    }
++
++    /** What that plugin cost on that tick, in milliseconds. */
++    public static double worstTickPluginMillis(int seconds) {
++        int at = worstIndexOf(seconds);
++        return at < 0 ? 0.0D : worstPluginNanos[at] / 1_000_000.0D;
+     }
+ 
+     // --- global sections ----------------------------------------------------------------
+@@ -208,6 +244,12 @@ public final class VoidSoulProfiler {
+      */
+     public static void startTick() {
+         java.util.Arrays.fill(currentTick, 0L);
++
++        // Zeroed rather than cleared: the entries are one per plugin and are reused every
++        // tick, so no map churn on a path that runs twenty times a second.
++        for (long[] slot : pluginNanos.values()) {
++            slot[0] = 0L;
++        }
+     }
+ 
+     /**
+@@ -228,6 +270,20 @@ public final class VoidSoulProfiler {
+         if (durationNanos > worstDuration[worstIndex]) {
+             worstDuration[worstIndex] = durationNanos;
+             System.arraycopy(currentTick, 0, worstBreakdown[worstIndex], 0, SECTION_COUNT);
++
++            // Whichever plugin spent the most in the scheduler on this tick.
++            String topPlugin = null;
++            long topNanos = 0L;
++
++            for (java.util.Map.Entry<String, long[]> entry : pluginNanos.entrySet()) {
++                if (entry.getValue()[0] > topNanos) {
++                    topNanos = entry.getValue()[0];
++                    topPlugin = entry.getKey();
++                }
++            }
++
++            worstPlugin[worstIndex] = topPlugin;
++            worstPluginNanos[worstIndex] = topNanos;
+         }
+ 
+         long now = System.nanoTime();
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index f036709c4895639d6f3af764c209e1caa643d5dd..3bd8b2046b78144ed07c3362b2c241254c43932b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -348,6 +348,7 @@ public class CraftScheduler implements BukkitScheduler {
+                 continue;
+             }
+             if (task.isSync()) {
++                long voidsoulTaskStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start(); // VoidSoulSpigot - name the plugin behind a scheduler spike
+                 try {
+                     task.run();
+                 } catch (final Throwable throwable) {
+@@ -365,6 +366,14 @@ public class CraftScheduler implements BukkitScheduler {
+                     );
+                     // Paper end
+                 }
++                // VoidSoulSpigot start - charge the task to its plugin, so a scheduler spike
++                // can be reported as a name rather than as "the scheduler". Timed in the
++                // finally position so a task that threw is still accounted for.
++                if (voidsoulTaskStart != 0L && task.getOwner() != null) {
++                    com.voidsoul.spigot.perf.VoidSoulProfiler.recordPluginTask(
++                            task.getOwner().getName(), System.nanoTime() - voidsoulTaskStart);
++                }
++                // VoidSoulSpigot end
+                 parsePending();
+             } else {
+                 debugTail = debugTail.setNext(new CraftAsyncDebugger(currentTick + RECENT_TICKS, task.getOwner(), task.getTaskClass()));
