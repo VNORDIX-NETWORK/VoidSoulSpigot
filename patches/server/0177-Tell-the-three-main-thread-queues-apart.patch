@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 00:34:41 -0500
+Subject: [PATCH] Tell the three main thread queues apart
+
+The "scheduler" section covered three different queues at once: the main
+thread FutureTask queue, the Bukkit scheduler, and CraftBukkit's
+processQueue. Only the middle one runs tasks that know which plugin owns
+them, so a spike in either of the other two reports as scheduler time
+with no plugin behind it - which is indistinguishable from the
+attribution simply not working.
+
+That matters here because FastAsyncWorldEdit applies its edits through
+the main thread queue rather than as a Bukkit task, so a mine reset
+driven by it would show 174 ms of "scheduler" and name nobody.
+
+The per-tick breakdown now separates them into "task queue", "scheduler"
+and "process queue". The rolling average still reports all three together
+as before, since that is the number worth watching per tick.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index 4520ddbda236a0db72fd05d1f6ed16dd8efe7457..c62742d0ab75974f017f9fbece46cd9cda319060 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -80,10 +80,13 @@ public final class VoidSoulProfiler {
+     public static final int SECTION_SCHEDULER = 5;
+     public static final int SECTION_SAVE = 6;
+     public static final int SECTION_LIGHTING = 7;
+-    public static final int SECTION_COUNT = 8;
++    public static final int SECTION_TASK_QUEUE = 8;
++    public static final int SECTION_PROCESS_QUEUE = 9;
++    public static final int SECTION_COUNT = 10;
+ 
+     public static final String[] SECTION_NAMES = {
+-            "worlds", "entities", "tracker", "chunk send", "chunk load", "scheduler", "save", "lighting"
++            "worlds", "entities", "tracker", "chunk send", "chunk load", "scheduler", "save", "lighting",
++            "task queue", "process queue"
+     };
+ 
+     /** What each section has cost so far on the tick being processed. */
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 5bddb972343285515f4cbe739b0328bdb112e6c3..5dd502a5e09b8e702cd644e81316ecdf88139066 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -845,10 +845,24 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+ 
+         this.methodProfiler.c("levels");
+ 
++        // VoidSoulSpigot - close the main thread task queue's own section. Only the Bukkit
++        // scheduler below can name the plugin behind a task, so a spike sitting in this
++        // queue or in processQueue needs to be told apart from one that can be attributed.
++        com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_TASK_QUEUE,
++                voidsoulSchedulerStart == 0L ? 0L : System.nanoTime() - voidsoulSchedulerStart);
++        long voidsoulBukkitStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start();
++
+         SpigotTimings.bukkitSchedulerTimer.startTiming(); // Spigot
+         // CraftBukkit start
+         this.server.getScheduler().mainThreadHeartbeat(this.ticks);
+         SpigotTimings.bukkitSchedulerTimer.stopTiming(); // Spigot
++        // VoidSoulSpigot start - the Bukkit scheduler, the one that can name a plugin
++        com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_SCHEDULER,
++                voidsoulBukkitStart == 0L ? 0L : System.nanoTime() - voidsoulBukkitStart);
++        long voidsoulProcessStart = com.voidsoul.spigot.perf.VoidSoulProfiler.start();
++        // VoidSoulSpigot end
+ 
+         // Run tasks that are waiting on processing
+         SpigotTimings.processQueueTimer.startTiming(); // Spigot
+@@ -856,7 +870,14 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+             processQueue.remove().run();
+         }
+         SpigotTimings.processQueueTimer.stopTiming(); // Spigot
+-        com.voidsoul.spigot.perf.VoidSoulProfiler.record(com.voidsoul.spigot.perf.VoidSoulProfiler.schedulerNanos, voidsoulSchedulerStart, com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_SCHEDULER); // VoidSoulSpigot - internal profiler
++        // VoidSoulSpigot start - internal profiler. The rolling average still covers all
++        // three queues together; the per-tick breakdown keeps them apart.
++        com.voidsoul.spigot.perf.VoidSoulProfiler.recordSection(
++                com.voidsoul.spigot.perf.VoidSoulProfiler.SECTION_PROCESS_QUEUE,
++                voidsoulProcessStart == 0L ? 0L : System.nanoTime() - voidsoulProcessStart);
++        com.voidsoul.spigot.perf.VoidSoulProfiler.record(
++                com.voidsoul.spigot.perf.VoidSoulProfiler.schedulerNanos, voidsoulSchedulerStart);
++        // VoidSoulSpigot end
+ 
+         SpigotTimings.chunkIOTickTimer.startTiming(); // Spigot
+         org.bukkit.craftbukkit.chunkio.ChunkIOExecutor.tick();

@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 09:17:50 -0500
+Subject: [PATCH] Fix arrow hits going inconsistent when the arrow delay
+ exceeds melee's
+
+Reported: with hitDelayArrowTicks at 26, arrows sometimes do nothing and
+sometimes land normally.
+
+Vanilla has one invulnerability window, so maxNoDamageTicks was both how
+long an entity stays invulnerable and the number the half-window test
+halves:
+
+    if (noDamageTicks > maxNoDamageTicks / 2.0F)
+
+Giving arrows their own hitDelayArrowTicks broke that. noDamageTicks was
+set to 26 while maxNoDamageTicks stayed at melee's 20, so the test became
+"26 > 10" - true for sixteen ticks. Those sixteen ticks took the
+already-hurt branch, where a second arrow either does nothing at all or
+does only the difference in damage with no knockback. The remaining ten
+took the fresh-hit branch and landed at full strength. The configured
+window was not one window; it was two phases that behave differently, and
+the boundary between them fell wherever melee's delay happened to be.
+
+The window each hit applies is now remembered and used by that test, so
+it halves the window in force rather than melee's. Vanilla behaviour is
+unchanged when arrow and melee delays match, which is the default.
+
+Also clears the worst-tick plugin name when a second's slot is recycled;
+it was left holding a name from a minute earlier, which the next tick
+overwrote but which was wrong in between.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index c62742d0ab75974f017f9fbece46cd9cda319060..c2caab5dd9762ebc36dd457de732e00c1b5e2f1a 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -300,6 +300,8 @@ public final class VoidSoulProfiler {
+             worstIndex = (worstIndex + 1) % WINDOW_SECONDS;
+             worstDuration[worstIndex] = 0L;
+             java.util.Arrays.fill(worstBreakdown[worstIndex], 0L);
++            worstPlugin[worstIndex] = null; // VoidSoulSpigot - was left holding a name from a minute ago
++            worstPluginNanos[worstIndex] = 0L;
+ 
+             for (RollingCounter counter : COUNTERS) {
+                 counter.roll();
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 344b920eb14a6ac9f37d1531ab56f7093a079279..aea815228f6e1acdfd8dbd358f7dbbb92c89ac85 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -51,6 +51,10 @@ public abstract class EntityLiving extends Entity {
+     public float aB;
+     public float aC;
+     public int maxNoDamageTicks = 20;
++    // VoidSoulSpigot - the invulnerability window the last hit actually applied. Arrows can
++    // use a different one from melee, and the half-window test below has to be asked about
++    // the window in force, not about melee's.
++    public int voidsoulHitWindow = -1;
+     public float aE;
+     public float aF;
+     public float aG;
+@@ -734,7 +738,21 @@ public abstract class EntityLiving extends Entity {
+                 this.aB = 1.5F;
+                 boolean flag = true;
+ 
+-                if ((float) this.noDamageTicks > (float) this.maxNoDamageTicks / 2.0F) {
++                // VoidSoulSpigot start - compare against the window the last hit applied.
++                //
++                // Vanilla has one window, so maxNoDamageTicks was both "how long you are
++                // invulnerable" and "what half of that is". Arrows can now have their own
++                // hitDelayArrowTicks, and with it larger than the melee delay - 26 against
++                // 20 - the test became "26 > 10" and stayed true for sixteen ticks. During
++                // those, a second arrow either did nothing or did the difference in damage
++                // with no knockback at all; after them, arrows landed at full strength
++                // again. That is the inconsistency, not a coincidence: the window that was
++                // applied and the window being halved were two different numbers.
++                float voidsoulWindow = this.voidsoulHitWindow >= 0
++                        ? (float) this.voidsoulHitWindow : (float) this.maxNoDamageTicks;
++
++                if ((float) this.noDamageTicks > voidsoulWindow / 2.0F) {
++                // VoidSoulSpigot end
+                     if (f <= this.lastDamage) {
+                         this.forceExplosionKnockback = true; // CraftBukkit - SPIGOT-949 - for vanilla consistency, cooldown does not prevent explosion knockback
+                         return false;
+@@ -759,6 +777,9 @@ public abstract class EntityLiving extends Entity {
+                     this.noDamageTicks = arrowDelay >= 0 && damagesource.i() instanceof EntityArrow
+                             ? arrowDelay
+                             : this.maxNoDamageTicks;
++                    // Remember what was applied, so the half-window test above is asked
++                    // about this window rather than melee's.
++                    this.voidsoulHitWindow = this.noDamageTicks;
+                     // VoidSoulSpigot end
+                     // CraftBukkit end
+                     this.hurtTicks = this.av = 10;
