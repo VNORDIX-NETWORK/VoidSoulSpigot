@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 20:49:44 -0500
+Subject: [PATCH] Show plugin versions in /plugins
+
+/plugins listed names only, so telling which build of a plugin is
+actually loaded meant reading plugin.yml or the startup log. Each entry
+now reads "PluginName (1.2.3)", keeping the existing green for enabled
+and red for disabled.
+
+A plugin whose description carries no version is printed as before,
+without empty parentheses.
+
+The display is switched by a public static field rather than a config
+lookup because this class is in the API module and cannot see the
+server's configuration; VoidSoulConfig pushes the value in on startup
+and on reload.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/org/bukkit/command/defaults/PluginsCommand.java b/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
+index e21d16793b703189a5f4cf9091ac12f494d0107e..97765718d6a91a873ab4e3074275c981e0c64b32 100644
+--- a/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
++++ b/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
+@@ -8,6 +8,17 @@ import org.bukkit.command.CommandSender;
+ import org.bukkit.plugin.Plugin;
+ 
+ public class PluginsCommand extends BukkitCommand {
++    // VoidSoulSpigot start - show each plugin's version
++    /**
++     * Whether {@code /plugins} prints each plugin's version after its name.
++     * <p>
++     * Set from VoidSoulSpigot's configuration on startup and on reload. It lives here as a
++     * field rather than a config lookup because this class is in the API module, which
++     * cannot see the server's configuration classes.
++     */
++    public static volatile boolean showVersions = true;
++    // VoidSoulSpigot end
++
+     public PluginsCommand(String name) {
+         super(name);
+         this.description = "Gets a list of plugins running on the server";
+@@ -36,6 +47,18 @@ public class PluginsCommand extends BukkitCommand {
+ 
+             pluginList.append(plugin.isEnabled() ? ChatColor.GREEN : ChatColor.RED);
+             pluginList.append(plugin.getDescription().getName());
++
++            // VoidSoulSpigot start - show each plugin's version
++            if (showVersions) {
++                String version = plugin.getDescription().getVersion();
++
++                if (version != null && !version.isEmpty()) {
++                    pluginList.append(" (");
++                    pluginList.append(version);
++                    pluginList.append(')');
++                }
++            }
++            // VoidSoulSpigot end
+         }
+ 
+         return "(" + plugins.length + "): " + pluginList.toString();

@@ -1,0 +1,57 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 20:49:52 -0500
+Subject: [PATCH] Make the /plugins version display configurable
+
+commands.pluginVersions, on by default, controls whether /plugins prints
+each plugin's version alongside its name.
+
+It is a switch rather than a fixed behaviour because of who can run the
+command: bukkit.command.plugins is granted to everyone by default, so
+/plugins and /pl are normally available to ordinary players, and the
+version list then tells anyone the exact build of everything the server
+runs - which is the first thing looked up when hunting for a known
+exploit. The config comment says so and names the other fix, which is
+taking that permission away from the default group.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index 7bc402fec0133c63d0ead12ebe31da1f27ac7182..e930096b63a150704f113bb2d972b70503fc752d 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -62,6 +62,11 @@ public class VoidSoulConfig {
+             dropMovedKnockbackSection(worldsNode); // VoidSoulSpigot - knockback lives in knockback.yml now
+             loader.save(root);
+ 
++            // VoidSoulSpigot - /plugins version display. Pushed rather than pulled because
++            // PluginsCommand lives in the API module and cannot see this class.
++            org.bukkit.command.defaults.PluginsCommand.showVersions =
++                    config.commands == null || config.commands.pluginVersions;
++
+             // VoidSoulSpigot start - internal profiler
+             com.voidsoul.spigot.perf.VoidSoulProfiler.setTimingsEnabled(
+                     config.debug != null && config.debug.profiler);
+@@ -323,6 +328,22 @@ public class VoidSoulConfig {
+         return Math.max(0, config.metrics.serviceId);
+     }
+ 
++    @Comment("Tweaks to the server's own commands.")
++    public CommandsConfig commands = new CommandsConfig();
++
++    @ConfigSerializable
++    public static class CommandsConfig {
++        @Comment("Show each plugin's version in /plugins, as \"PluginName (1.2.3)\".\n" +
++                "\n" +
++                "Worth knowing before leaving this on: bukkit.command.plugins is granted to\n" +
++                "everyone by default, so /plugins and /pl are usually available to ordinary\n" +
++                "players - and this then tells them the exact build of everything you run,\n" +
++                "which is the first thing someone looks up when hunting for a known exploit.\n" +
++                "Either turn this off, or take bukkit.command.plugins away from the default\n" +
++                "group in your permissions plugin.")
++        public boolean pluginVersions = true;
++    }
++
+     @Comment("Anonymous usage statistics.")
+     public MetricsConfig metrics = new MetricsConfig();
+ 
