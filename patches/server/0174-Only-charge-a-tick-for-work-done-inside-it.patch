@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 23:47:55 -0500
+Subject: [PATCH] Only charge a tick for work done inside it
+
+The section accumulators were cleared at the end of a tick, so time spent
+loading chunks between ticks - the spawn area during startup, and
+callbacks that run outside the tick loop - piled up until the next tick
+finished and was then charged entirely to that tick. A 26 ms tick
+reported 796 ms of chunk loading.
+
+They are now cleared when a tick opens, so work that belongs to no tick
+is discarded instead of being attributed to the next one.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+index d435599ce2313d10adfe7ef091b94261cec43efe..6ad29f5c08523ead19d8c7a198d9869b51dc39e5 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
++++ b/src/main/java/com/voidsoul/spigot/perf/VoidSoulProfiler.java
+@@ -197,6 +197,19 @@ public final class VoidSoulProfiler {
+ 
+     private static long lastRollNanos;
+ 
++    /**
++     * Opens a tick, discarding whatever the section accumulators hold.
++     * <p>
++     * Clearing here rather than at the end of the previous tick is deliberate. Chunks are
++     * also loaded outside the tick loop - the spawn area during startup, and callbacks that
++     * run between ticks - and that time belongs to no tick. Clearing at the end let it pile
++     * up until the next tick finished and then charged all of it to that tick, which is how
++     * a 26 ms tick came to report 796 ms of chunk loading.
++     */
++    public static void startTick() {
++        java.util.Arrays.fill(currentTick, 0L);
++    }
++
+     /**
+      * Records one finished tick and, on a second boundary, closes every counter's bucket.
+      * Called from the end of the server tick.
+@@ -217,8 +230,6 @@ public final class VoidSoulProfiler {
+             System.arraycopy(currentTick, 0, worstBreakdown[worstIndex], 0, SECTION_COUNT);
+         }
+ 
+-        java.util.Arrays.fill(currentTick, 0L);
+-
+         long now = System.nanoTime();
+ 
+         if (now - lastRollNanos >= 1_000_000_000L) {
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index c27c487a2a019fb86459305e09b0acfe3f7af00c..5bddb972343285515f4cbe739b0328bdb112e6c3 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -754,6 +754,7 @@ public abstract class MinecraftServer implements Runnable, ICommandListener, IAs
+         new com.destroystokyo.paper.event.server.ServerTickStartEvent(this.ticks + 1).callEvent(); // PandaSpigot - Add ServerTickStartEvent
+ 
+         ++this.ticks;
++        com.voidsoul.spigot.perf.VoidSoulProfiler.startTick(); // VoidSoulSpigot - open the tick's section accounting
+         com.voidsoul.spigot.chunk.ChunkSendBudget.startTick(); // VoidSoulSpigot - chunk send budget
+         com.voidsoul.spigot.chunk.SmartViewDistance.tick(this); // VoidSoulSpigot - smart view distance
+         com.voidsoul.spigot.adaptive.AdaptivePerformance.tick(); // VoidSoulSpigot - adaptive performance
