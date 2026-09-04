@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 21:42:38 -0500
+Subject: [PATCH] Print the plugin version in its own colour
+
+The version was printed in the plugin's own colour, so name and version
+read as one blob of green. It now has a separate colour, defaulting to
+grey, which lets the name stay the thing the eye lands on while the
+version sits behind it.
+
+The name keeps its meaning: green when the plugin is enabled, red when it
+is not. Only the version moves.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/org/bukkit/command/defaults/PluginsCommand.java b/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
+index 97765718d6a91a873ab4e3074275c981e0c64b32..eadc6a7b21937bdd695be80c809712719bbe30aa 100644
+--- a/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
++++ b/src/main/java/org/bukkit/command/defaults/PluginsCommand.java
+@@ -17,6 +17,13 @@ public class PluginsCommand extends BukkitCommand {
+      * cannot see the server's configuration classes.
+      */
+     public static volatile boolean showVersions = true;
++
++    /**
++     * Colour the version is printed in, so it reads as secondary to the name rather than
++     * competing with it. Set from VoidSoulSpigot's configuration alongside {@link
++     * #showVersions}.
++     */
++    public static volatile ChatColor versionColor = ChatColor.GRAY;
+     // VoidSoulSpigot end
+ 
+     public PluginsCommand(String name) {
+@@ -53,6 +60,12 @@ public class PluginsCommand extends BukkitCommand {
+                 String version = plugin.getDescription().getVersion();
+ 
+                 if (version != null && !version.isEmpty()) {
++                    ChatColor colour = versionColor;
++
++                    if (colour != null) {
++                        pluginList.append(colour);
++                    }
++
+                     pluginList.append(" (");
+                     pluginList.append(version);
+                     pluginList.append(')');

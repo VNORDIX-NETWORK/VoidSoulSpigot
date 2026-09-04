@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Thu, 3 Sep 2026 21:42:38 -0500
+Subject: [PATCH] Make the /plugins version colour configurable
+
+commands.pluginVersionColor takes any Bukkit colour name and defaults to
+GRAY.
+
+A typo falls back to grey with a warning rather than stopping the server,
+because a wrong colour is a cosmetic problem and refusing to boot over
+one would not be. Formatting codes that live in the same enum - BOLD,
+ITALIC and the rest - are rejected the same way, since using one would
+leave the remainder of the line formatted.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+index e930096b63a150704f113bb2d972b70503fc752d..aee0d5a42cd05cde6c68de23887243ecbf379d68 100644
+--- a/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
++++ b/src/main/java/com/voidsoul/spigot/config/VoidSoulConfig.java
+@@ -66,6 +66,9 @@ public class VoidSoulConfig {
+             // PluginsCommand lives in the API module and cannot see this class.
+             org.bukkit.command.defaults.PluginsCommand.showVersions =
+                     config.commands == null || config.commands.pluginVersions;
++            org.bukkit.command.defaults.PluginsCommand.versionColor = parseColor(
++                    config.commands == null ? null : config.commands.pluginVersionColor,
++                    org.bukkit.ChatColor.GRAY, "commands.pluginVersionColor");
+ 
+             // VoidSoulSpigot start - internal profiler
+             com.voidsoul.spigot.perf.VoidSoulProfiler.setTimingsEnabled(
+@@ -114,6 +117,35 @@ public class VoidSoulConfig {
+         }
+     }
+ 
++    /**
++     * Reads a Bukkit colour name from the config.
++     * <p>
++     * A typo falls back and says so rather than stopping the server: a wrong colour is a
++     * cosmetic problem, and refusing to boot over one would not be.
++     */
++    private static org.bukkit.ChatColor parseColor(String name, org.bukkit.ChatColor fallback, String key) {
++        if (name == null || name.trim().isEmpty()) {
++            return fallback;
++        }
++
++        try {
++            org.bukkit.ChatColor parsed = org.bukkit.ChatColor.valueOf(
++                    name.trim().toUpperCase(java.util.Locale.ROOT));
++
++            // Bold, italic and the rest are in the same enum but are not colours; using one
++            // here would leave the rest of the line formatted.
++            return parsed.isColor() ? parsed : warnAndFallback(name, fallback, key);
++        } catch (IllegalArgumentException e) {
++            return warnAndFallback(name, fallback, key);
++        }
++    }
++
++    private static org.bukkit.ChatColor warnAndFallback(String name, org.bukkit.ChatColor fallback, String key) {
++        org.bukkit.Bukkit.getLogger().warning("VoidSoul: " + key + " is set to \"" + name
++                + "\", which is not a colour. Using " + fallback.name() + " instead.");
++        return fallback;
++    }
++
+     private static void initWorlds(ConfigurationNode node) throws Exception {
+         worldConfigs.clear();
+         for (Map.Entry<Object, ? extends ConfigurationNode> entry : node.childrenMap().entrySet()) {
+@@ -342,6 +374,15 @@ public class VoidSoulConfig {
+                 "Either turn this off, or take bukkit.command.plugins away from the default\n" +
+                 "group in your permissions plugin.")
+         public boolean pluginVersions = true;
++
++        @Comment("Colour the version is printed in, so it reads as secondary to the plugin\n" +
++                "name instead of competing with it. The name keeps its own colour: green when\n" +
++                "the plugin is enabled, red when it is not.\n" +
++                "\n" +
++                "Any Bukkit colour name works - GRAY, DARK_GRAY, WHITE, YELLOW, AQUA and so\n" +
++                "on. An unrecognised name falls back to GRAY and logs a warning rather than\n" +
++                "failing to start.")
++        public String pluginVersionColor = "GRAY";
+     }
+ 
+     @Comment("Anonymous usage statistics.")
