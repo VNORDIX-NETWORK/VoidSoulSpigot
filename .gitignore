@@ -19,3 +19,7 @@ VoidSoulSpigot-paperclip.jar
 
 # Imanity reference configs - contains a paid license key, never commit
 /imanity/
+
+# Server logs - contain player names and IP addresses
+latest.log
+*.log

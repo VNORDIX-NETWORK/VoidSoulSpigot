@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Emmanuel Velez Garcia <velezgarciaemmanuel25@gmail.com>
+Date: Fri, 4 Sep 2026 15:25:46 -0500
+Subject: [PATCH] Average the mass fill benchmark over several passes
+
+The first two readings came out at 81 ms and 209 ms for identical work.
+That spread is far too wide to decide an optimisation on, and the cause
+was measuring a cold loop: the first pass through runs interpreted while
+the JIT is still compiling it.
+
+There is now a discarded warm-up pass, the timed passes are repeated and
+reported by median, and min and max are shown next to it so the spread is
+visible rather than hidden. A spread over 1.5x is called out in the
+output as noisy, because a number that varies that much should not be
+the basis for a change.
+
+The area is cleared outside the timed section, so the figure is the cost
+of filling rather than of filling plus clearing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java b/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java
+index f44ac2f81730f35b5dc658ce7b23181dcaf1f598..1c265aa1fb5dd671813b061d2a2beef839922a6c 100644
+--- a/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java
++++ b/src/main/java/com/voidsoul/spigot/bench/MassFillBenchmark.java
+@@ -31,25 +31,39 @@ public final class MassFillBenchmark {
+     private MassFillBenchmark() {
+     }
+ 
+-    /** What one run measured. All times in milliseconds. */
++    /** What a set of runs measured. All times in milliseconds. */
+     public static final class Result {
+         public final int chunks;
+         public final int blocks;
+-        public final double totalMillis;
++        public final int passes;
++        public final double medianMillis;
++        public final double minMillis;
++        public final double maxMillis;
+         public final double lightingMillis;
+-        public final double worldMillis;
+ 
+-        Result(int chunks, int blocks, double totalMillis, double lightingMillis, double worldMillis) {
++        Result(int chunks, int blocks, int passes, double medianMillis, double minMillis,
++               double maxMillis, double lightingMillis) {
+             this.chunks = chunks;
+             this.blocks = blocks;
+-            this.totalMillis = totalMillis;
++            this.passes = passes;
++            this.medianMillis = medianMillis;
++            this.minMillis = minMillis;
++            this.maxMillis = maxMillis;
+             this.lightingMillis = lightingMillis;
+-            this.worldMillis = worldMillis;
+         }
+ 
+         /** Share of the fill that was the server relighting chunks. */
+         public double lightingShare() {
+-            return this.totalMillis <= 0.0D ? 0.0D : this.lightingMillis / this.totalMillis;
++            return this.medianMillis <= 0.0D ? 0.0D : this.lightingMillis / this.medianMillis;
++        }
++
++        /**
++         * How far apart the fastest and slowest passes were. A single pair of runs came out
++         * at 81 ms and 209 ms for identical work, which is far too noisy to decide an
++         * optimisation on - so the spread is reported rather than hidden behind a median.
++         */
++        public double spread() {
++            return this.minMillis <= 0.0D ? 0.0D : this.maxMillis / this.minMillis;
+         }
+     }
+ 
+@@ -60,7 +74,7 @@ public final class MassFillBenchmark {
+      * @param side   how many chunks on a side; 6 is 36 chunks, about a small mine
+      * @param height how many blocks tall each column is
+      */
+-    public static Result run(WorldServer world, int side, int height) {
++    public static Result run(WorldServer world, int side, int height, int passes) {
+         IBlockData stone = Blocks.STONE.getBlockData();
+         IBlockData air = Blocks.AIR.getBlockData();
+ 
+@@ -71,41 +85,38 @@ public final class MassFillBenchmark {
+             }
+         }
+ 
+-        long lightingBefore = VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING);
+-        long worldBefore = VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_WORLDS);
++        // One discarded pass first. The JIT has not compiled this loop on the first run
++        // through it, and a cold measurement mixed in with warm ones is what produced 81 ms
++        // against 209 ms for identical work.
++        fill(world, side, height, stone);
++        fill(world, side, height, air);
+ 
+-        int blocks = 0;
+-        long start = System.nanoTime();
++        double[] timings = new double[passes];
++        long lighting = 0L;
++        int blocks = side * side * 16 * 16 * height;
+ 
+-        for (int cx = 0; cx < side; cx++) {
+-            for (int cz = 0; cz < side; cz++) {
+-                int originX = (BASE_CHUNK + cx) << 4;
+-                int originZ = (BASE_CHUNK + cz) << 4;
++        for (int pass = 0; pass < passes; pass++) {
++            long lightingBefore = VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING);
++            long start = System.nanoTime();
+ 
+-                for (int x = 0; x < 16; x++) {
+-                    for (int z = 0; z < 16; z++) {
+-                        for (int y = 1; y <= height; y++) {
+-                            // Flag 2 is "notify clients"; nobody is within a thousand blocks
+-                            // of here, so no packets are produced and what is measured is
+-                            // the block change itself rather than the network.
+-                            world.setTypeAndData(new BlockPosition(originX + x, y, originZ + z), stone, 2);
+-                            blocks++;
+-                        }
+-                    }
+-                }
+-            }
++            fill(world, side, height, stone);
++
++            timings[pass] = (System.nanoTime() - start) / 1_000_000.0D;
++            lighting += VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING) - lightingBefore;
++
++            // Cleared outside the timed section, so the figure is the cost of filling and
++            // not of filling plus clearing.
++            fill(world, side, height, air);
+         }
+ 
+-        double totalMillis = (System.nanoTime() - start) / 1_000_000.0D;
+-        double lightingMillis =
+-                (VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_LIGHTING) - lightingBefore)
+-                        / 1_000_000.0D;
+-        double worldMillis =
+-                (VoidSoulProfiler.currentTickSection(VoidSoulProfiler.SECTION_WORLDS) - worldBefore)
+-                        / 1_000_000.0D;
++        java.util.Arrays.sort(timings);
+ 
+-        // Put it back, so a second run measures the same thing as the first rather than
+-        // filling already-solid chunks.
++        return new Result(side * side, blocks, passes,
++                timings[passes / 2], timings[0], timings[passes - 1],
++                lighting / 1_000_000.0D / passes);
++    }
++
++    private static void fill(WorldServer world, int side, int height, IBlockData data) {
+         for (int cx = 0; cx < side; cx++) {
+             for (int cz = 0; cz < side; cz++) {
+                 int originX = (BASE_CHUNK + cx) << 4;
+@@ -114,13 +125,14 @@ public final class MassFillBenchmark {
+                 for (int x = 0; x < 16; x++) {
+                     for (int z = 0; z < 16; z++) {
+                         for (int y = 1; y <= height; y++) {
+-                            world.setTypeAndData(new BlockPosition(originX + x, y, originZ + z), air, 2);
++                            // Flag 2 is "notify clients"; nobody is within a thousand blocks
++                            // of here, so no packets are produced and what is measured is
++                            // the block change itself rather than the network.
++                            world.setTypeAndData(new BlockPosition(originX + x, y, originZ + z), data, 2);
+                         }
+                     }
+                 }
+             }
+         }
+-
+-        return new Result(side * side, blocks, totalMillis, lightingMillis, worldMillis);
+     }
+ }
+diff --git a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+index ca9321d470862e89daa80bd47b4c8d0e4b3a2734..10f3431c6a3bd420239ea518f01b64c27f947040 100644
+--- a/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
++++ b/src/main/java/com/voidsoul/spigot/perf/PerfCommand.java
+@@ -496,7 +496,8 @@ public final class PerfCommand extends Command {
+     private boolean massfill(CommandSender sender, String[] args) {
+         int side = parse(args, 2, 6, 1, 16);
+         int height = parse(args, 3, 64, 1, 200);
+-        boolean force = args.length > 4 && args[4].equalsIgnoreCase("force");
++        int passes = parse(args, 4, 5, 1, 25);
++        boolean force = args.length > 5 && args[5].equalsIgnoreCase("force");
+         int online = MinecraftServer.getServer().getPlayerList().getPlayerCount();
+ 
+         if (online > 0 && !force) {
+@@ -509,12 +510,12 @@ public final class PerfCommand extends Command {
+         WorldServer world = MinecraftServer.getServer().worlds.get(0);
+ 
+         sender.sendMessage(LABEL + "Filling " + (side * side) + " chunks, " + height
+-                + " blocks tall, then clearing them...");
++                + " blocks tall, " + passes + " times plus a warm-up...");
+ 
+         MassFillBenchmark.Result result;
+ 
+         try {
+-            result = MassFillBenchmark.run(world, side, height);
++            result = MassFillBenchmark.run(world, side, height, passes);
+         } catch (Throwable throwable) {
+             sender.sendMessage(ChatColor.RED + "Benchmark failed: " + throwable);
+             MinecraftServer.LOGGER.warn("VoidSoul mass fill benchmark failed", throwable);
+@@ -523,9 +524,14 @@ public final class PerfCommand extends Command {
+ 
+         header(sender, "Mass block change benchmark");
+         line(sender, "Filled", result.chunks + "" + LABEL + " chunks, " + VALUE + result.blocks
+-                + LABEL + " blocks in " + VALUE + String.format("%.0f ms", result.totalMillis));
+-        line(sender, "Per block", String.format("%.1f us",
+-                result.totalMillis * 1000.0D / Math.max(1, result.blocks)));
++                + LABEL + " blocks, " + VALUE + result.passes + LABEL + " passes");
++        line(sender, "Median", String.format("%.0f ms", result.medianMillis) + LABEL
++                + String.format("   min %.0f  max %.0f", result.minMillis, result.maxMillis)
++                + (result.spread() >= 1.5D
++                ? ChatColor.YELLOW + String.format("  (%.1fx spread - treat as noisy)", result.spread())
++                : ""));
++        line(sender, "Per block", String.format("%.2f us",
++                result.medianMillis * 1000.0D / Math.max(1, result.blocks)));
+         line(sender, "Relighting", String.format("%.0f ms", result.lightingMillis) + LABEL
+                 + String.format("  (%.0f%% of the fill)", result.lightingShare() * 100.0D));
+         sender.sendMessage(LABEL + "This is the server's own share of a mass block change. "
